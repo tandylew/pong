@@ -1,0 +1,8 @@
+{
+  "auth": false,
+  "tools": false,
+  "backup": false,
+  "pwa": false,
+  "qr": true,
+  "stats": false
+}

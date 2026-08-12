@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pong 3D</title>
+<script src="karaoke-store.js"></script>
+<script src="karaoke-features.js"></script>
+<style>
+  :root { --ink:#e2e8f0; --muted:#94a3b8; --line:#2a3355; --accent:#6366f1; --accent2:#22d3ee; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { height:100%; }
+  body { font-family:system-ui,-apple-system,sans-serif; color:var(--ink);
+         background:#0b1020; overflow:hidden; }
+  #stage { position:fixed; inset:0; }
+  canvas#game { display:block; width:100%; height:100%; }
+
+  #hud { position:fixed; top:0; left:0; right:0; display:none; justify-content:space-between;
+         align-items:center; padding:.9rem 1.2rem; pointer-events:none; }
+  #score { font-size:2rem; font-weight:700; letter-spacing:.05em;
+           text-shadow:0 2px 12px rgba(0,0,0,.6); }
+  #netStatus { font-size:.8rem; color:var(--muted); text-align:right; max-width:60vw; }
+
+  #menu { position:fixed; inset:0; display:grid; place-items:center; padding:1rem; }
+  .panel { background:rgba(17,22,45,.9); border:1px solid var(--line); border-radius:16px;
+           padding:1.6rem; width:100%; max-width:380px; display:grid; gap:1rem;
+           box-shadow:0 20px 60px rgba(0,0,0,.5); backdrop-filter:blur(6px); }
+  .panel h1 { font-size:1.5rem; text-align:center; letter-spacing:-.02em; }
+  .panel h1 span { color:var(--accent2); }
+  .panel p.sub { color:var(--muted); font-size:.85rem; text-align:center; margin-top:-.5rem; }
+  .big-btn { padding:.85rem 1rem; font-size:1rem; font-weight:600; border:0; border-radius:11px;
+             background:var(--accent); color:#fff; cursor:pointer; }
+  .big-btn:hover { filter:brightness(1.1); }
+  .big-btn.ghost { background:transparent; border:1px solid var(--line); color:var(--ink); }
+  .divider { display:flex; align-items:center; gap:.6rem; color:var(--muted); font-size:.75rem;
+             text-transform:uppercase; letter-spacing:.08em; }
+  .divider::before, .divider::after { content:""; flex:1; height:1px; background:var(--line); }
+  .row { display:flex; gap:.5rem; }
+  .row input { flex:1; padding:.7rem .8rem; font-size:1rem; border:1px solid var(--line);
+               border-radius:9px; background:#0e1430; color:var(--ink); text-transform:uppercase;
+               letter-spacing:.1em; text-align:center; }
+  .row input:focus { outline:2px solid var(--accent); }
+  .row .big-btn { flex:0 0 auto; }
+  #msg { color:#fbbf24; font-size:.82rem; text-align:center; min-height:1.1em; }
+  .controls-hint { color:var(--muted); font-size:.78rem; text-align:center; }
+
+  #winOverlay { position:fixed; inset:0; display:none; place-items:center;
+                background:rgba(11,16,32,.75); backdrop-filter:blur(3px); }
+  #winOverlay .panel { text-align:center; }
+  #winText { font-size:1.8rem; font-weight:700; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="game"></canvas></div>
+
+  <div id="hud">
+    <div id="score">0 – 0</div>
+    <div id="netStatus"></div>
+  </div>
+
+  <div id="menu">
+    <div class="panel">
+      <h1>3D <span>Pong</span></h1>
+      <p class="sub">Three.js pong — play local split-screen, or open a room across two devices.</p>
+
+      <button id="btnLocal" class="big-btn">Local 2-Player (same keyboard)</button>
+
+      <div class="divider">online</div>
+
+      <button id="btnHost" class="big-btn">Create Room</button>
+      <div class="row">
+        <input id="joinCode" placeholder="CODE" maxlength="6">
+        <button id="btnJoin" class="big-btn ghost">Join</button>
+      </div>
+      <p class="controls-hint">Host controls the left paddle, guest the right. Move with W/S or ↑/↓.
+        Share the room by opening the dock's share/QR button after creating it.</p>
+      <div id="msg"></div>
+    </div>
+  </div>
+
+  <div id="winOverlay">
+    <div class="panel">
+      <div id="winText"></div>
+      <button id="btnRematch" class="big-btn">Rematch</button>
+      <button id="btnMenu" class="big-btn ghost">Main Menu</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script src="pong.js"></script>
+</body>
+</html>
