@@ -1,10 +1,15 @@
-/* pong.js — 3D Pong (Three.js), local 2-player + online multiplayer via kstore.sys.
+/* pong.js — 3D Pong (Three.js), local 2-player + online multiplayer.
  *
- * Online sync has no websocket available in this environment, so it polls
- * kstore.sys (shared, not per-user) at ~12Hz. That works when a karaoke
- * server is answering /api/data (local preview or a GCP deploy) — on plain
- * static hosting kstore.sys falls back to localStorage, which only one
- * browser can see, so "Join" will just time out. The menu says as much.
+ * This deploys to GitHub Pages — plain static hosting, nobody answering
+ * /api/data — so kstore has no shared backend to poll and localStorage
+ * is private per browser. That rules out any store-and-poll approach for
+ * crossing devices. Instead, online play uses real peer-to-peer WebRTC
+ * (via PeerJS's free public signaling broker, id.peerjs.com) — the room
+ * code IS the PeerJS id, the two browsers find each other through that
+ * cloud broker just long enough to open a direct data channel, and all
+ * game state after that flows browser-to-browser, no backend involved.
+ * Needs a network path between the two peers (works on most home wifi;
+ * strict corporate/school firewalls without STUN egress can block it).
  */
 (function () {
   "use strict";
@@ -185,13 +190,56 @@
   const urlRoom = new URLSearchParams(location.search).get("room");
   if (urlRoom) $("joinCode").value = urlRoom.toUpperCase();
 
-  // ---------- networking (kstore.sys polling) ----------
-  let netTimer = null, roomCode = null;
-  function roomKey(code, part) { return "pong/" + code + "/" + part; }
+  // ---------- networking (WebRTC data channel via PeerJS) ----------
+  // Namespaced so this game's room codes don't collide with other apps
+  // sharing the same public broker's global id space.
+  const PEER_NS = "kpong3d-";
+  let peer = null, conn = null, netTimer = null, roomCode = null, joinTimeout = null;
 
-  function stopNet() {
+  function teardownPeer() {
     if (netTimer) { clearInterval(netTimer); netTimer = null; }
+    if (joinTimeout) { clearTimeout(joinTimeout); joinTimeout = null; }
+    if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     roomCode = null;
+  }
+  function stopNet() { teardownPeer(); }
+  addEventListener("beforeunload", teardownPeer);
+
+  function wireConnection(onOpen) {
+    conn.on("open", () => {
+      state.running = true;
+      netEl.textContent = "Room " + roomCode + " — connected";
+      if (netTimer) clearInterval(netTimer);
+      netTimer = setInterval(sendState, SYNC_MS);
+      if (onOpen) onOpen();
+    });
+    conn.on("data", (data) => {
+      if (state.mode === "host") {
+        netTarget.zR = data.z;
+      } else if (state.mode === "guest") {
+        netTarget.zL = data.zL; netTarget.bx = data.bx; netTarget.bz = data.bz;
+        state.scoreL = data.sL; state.scoreR = data.sR;
+      }
+    });
+    conn.on("close", () => {
+      state.running = false;
+      netEl.textContent = state.mode === "host" ? "Opponent disconnected." : "Host disconnected.";
+      if (netTimer) { clearInterval(netTimer); netTimer = null; }
+      conn = null;
+    });
+    conn.on("error", () => {
+      netEl.textContent = "Connection error.";
+    });
+  }
+
+  function sendState() {
+    if (!conn || !conn.open) return;
+    if (state.mode === "host") {
+      conn.send({ zL: state.zL, bx: state.bx, bz: state.bz, sL: state.scoreL, sR: state.scoreR });
+    } else if (state.mode === "guest") {
+      conn.send({ z: state.zR });
+    }
   }
 
   async function startHost(code) {
@@ -199,28 +247,28 @@
     roomCode = code; state.mode = "host";
     state.serve = 1; resetMatch(); state.running = false;
     showGame();
-    netEl.textContent = "Room " + code + " — waiting for opponent… (share via the dock's share button)";
-    await kstore.sys.set(roomKey(code, "meta"), { createdAt: Date.now() });
-    await kstore.sys.set(roomKey(code, "host"), { z: 0, t: Date.now() });
-    await kstore.sys.set(roomKey(code, "guest"), null);
+    netEl.textContent = "Room " + code + " — opening…";
 
-    let guestSeenAt = 0;
-    netTimer = setInterval(async () => {
-      try {
-        const g = await kstore.sys.get(roomKey(code, "guest"), null);
-        if (g && g.t) {
-          if (!state.running) { state.running = true; netEl.textContent = "Room " + code + " — connected"; }
-          guestSeenAt = Date.now();
-          netTarget.zR = g.z;
-        } else if (state.running && Date.now() - guestSeenAt > 4000) {
-          state.running = false; netEl.textContent = "Opponent disconnected.";
-        }
-        await kstore.sys.set(roomKey(code, "host"), { z: state.zL, t: Date.now() });
-        await kstore.sys.set(roomKey(code, "ball"), {
-          bx: state.bx, bz: state.bz, sL: state.scoreL, sR: state.scoreR, t: Date.now(),
-        });
-      } catch (e) { /* transient — next tick retries */ }
-    }, SYNC_MS);
+    peer = new Peer(PEER_NS + code);
+    peer.on("open", () => {
+      netEl.textContent = "Room " + code + " — waiting for opponent… (share via the dock's share button)";
+    });
+    peer.on("connection", (c) => {
+      if (conn) { try { conn.close(); } catch (e) {} } // newest challenger wins
+      conn = c;
+      wireConnection();
+    });
+    peer.on("error", (err) => {
+      if (err.type === "unavailable-id") {
+        // vanishingly rare with a 4-char code, but don't get stuck on it
+        const fresh = genCode();
+        history.replaceState(null, "", "?room=" + fresh);
+        teardownPeer();
+        startHost(fresh);
+      } else {
+        netEl.textContent = "Couldn't open a room (" + err.type + "). Check your connection and try again.";
+      }
+    });
   }
 
   async function startGuest(code) {
@@ -230,29 +278,27 @@
     showGame();
     netEl.textContent = "Joining room " + code + "…";
 
-    const meta = await kstore.sys.get(roomKey(code, "meta"), null);
-    if (!meta) {
-      netEl.textContent = 'No room "' + code + '" found. Check the code (or ask the host to create one).';
-      state.mode = "menu"; showMenu(netEl.textContent);
-      return;
-    }
-
-    let hostSeenAt = Date.now();
-    netTimer = setInterval(async () => {
-      try {
-        const h = await kstore.sys.get(roomKey(code, "host"), null);
-        const b = await kstore.sys.get(roomKey(code, "ball"), null);
-        if (h && h.t) {
-          hostSeenAt = Date.now();
-          netTarget.zL = h.z;
-          if (!state.running) { state.running = true; netEl.textContent = "Room " + code + " — connected"; }
-        } else if (Date.now() - hostSeenAt > 4000) {
-          state.running = false; netEl.textContent = "Host not responding.";
+    peer = new Peer();
+    peer.on("open", () => {
+      conn = peer.connect(PEER_NS + code, { reliable: true });
+      wireConnection();
+      conn.on("error", () => {}); // surfaced via peer's "error" below
+      joinTimeout = setTimeout(() => {
+        if (!state.running) {
+          const msg = 'No room "' + code + '" found. Check the code (or ask the host to create one).';
+          teardownPeer(); showMenu(msg);
         }
-        if (b && b.t) { netTarget.bx = b.bx; netTarget.bz = b.bz; state.scoreL = b.sL; state.scoreR = b.sR; }
-        await kstore.sys.set(roomKey(code, "guest"), { z: state.zR, t: Date.now() });
-      } catch (e) { /* transient */ }
-    }, SYNC_MS);
+      }, 10000);
+    });
+    peer.on("error", (err) => {
+      if (err.type === "peer-unavailable") {
+        const msg = 'No room "' + code + '" found. Check the code (or ask the host to create one).';
+        teardownPeer(); showMenu(msg);
+      } else {
+        const msg = "Couldn't connect (" + err.type + "). Check your connection and try again.";
+        teardownPeer(); showMenu(msg);
+      }
+    });
   }
 
   // interpolation targets for values arriving over the network

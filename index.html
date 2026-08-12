@@ -73,7 +73,9 @@
         <button id="btnJoin" class="big-btn ghost">Join</button>
       </div>
       <p class="controls-hint">Host controls the left paddle, guest the right. Move with W/S or ↑/↓.
-        Share the room by opening the dock's share/QR button after creating it.</p>
+        Share the room by opening the dock's share/QR button after creating it — connects
+        peer-to-peer, so it works across devices and networks (most home wifi; some
+        locked-down school/office networks may block it).</p>
       <div id="msg"></div>
     </div>
   </div>
@@ -87,6 +89,7 @@
   </div>
 
   <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="pong.js"></script>
 </body>
 </html>
