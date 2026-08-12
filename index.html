@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pong</title>
+<script src="karaoke-store.js"></script>
+<script src="karaoke-features.js"></script>
+<style>
+  :root { --ink:#1e293b; --muted:#64748b; --line:#e2e8f0; --accent:#6366f1; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,sans-serif; color:var(--ink);
+         background:#f8fafc; min-height:100vh; padding:2.5rem 1rem; }
+  .wrap { max-width:560px; margin:0 auto; display:grid; gap:1.2rem; }
+  header { text-align:center; padding-bottom:.5rem; }
+  h1 { font-size:1.9rem; letter-spacing:-.02em; }
+  header p { color:var(--muted); margin-top:.4rem; font-size:.95rem; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:1.3rem; }
+  .card h2 { font-size:.78rem; text-transform:uppercase; letter-spacing:.08em;
+             color:var(--muted); margin-bottom:.9rem; }
+  form { display:flex; gap:.6rem; }
+  input { flex:1; padding:.55rem .75rem; font-size:1rem; border:1px solid var(--line);
+          border-radius:9px; background:#f8fafc; }
+  input:focus { outline:2px solid var(--accent); border-color:transparent; }
+  button { padding:.55rem 1rem; font-size:.95rem; font-weight:600; border:0;
+           border-radius:9px; background:var(--accent); color:#fff; cursor:pointer; }
+  ul { list-style:none; display:grid; gap:.45rem; margin-top:.9rem; }
+  li { display:flex; justify-content:space-between; align-items:center; gap:.6rem;
+       background:#f8fafc; border-radius:8px; padding:.5rem .7rem; font-size:.95rem; }
+  li button { background:none; color:#dc2626; padding:0 .2rem; font-size:1rem; }
+  .empty { color:var(--muted); font-size:.88rem; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>pong</h1>
+      <p>Fresh project — hold the mic in the Karaoke HUD and say what to build.</p>
+    </header>
+    <section class="card">
+      <h2>Notes (saved with kstore — survives refresh &amp; deploys)</h2>
+      <form id="noteForm">
+        <input id="noteText" placeholder="write a note…" autocomplete="off">
+        <button type="submit">Add</button>
+      </form>
+      <ul id="noteList"><li class="empty">Nothing yet.</li></ul>
+    </section>
+  </div>
+<script>
+  const list = document.getElementById("noteList");
+  let notes = [];
+  function render() {
+    list.innerHTML = notes.length
+      ? notes.map((n, i) =>
+          `<li><span>${n.replace(/</g, "&lt;")}</span><button data-i="${i}">✕</button></li>`).join("")
+      : '<li class="empty">Nothing yet.</li>';
+  }
+  list.addEventListener("click", async e => {
+    if (e.target.dataset.i === undefined) return;
+    notes.splice(+e.target.dataset.i, 1);
+    await kstore.set("notes", notes); render();
+  });
+  document.getElementById("noteForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const t = document.getElementById("noteText").value.trim();
+    if (!t) return;
+    notes.push(t);
+    document.getElementById("noteText").value = "";
+    await kstore.set("notes", notes); render();
+  });
+  kstore.get("notes", []).then(v => { notes = v || []; render(); });
+</script>
+</body>
+</html>
