@@ -347,7 +347,121 @@
     var id = pendingHost.id;
     pendingHost = null;
     if (stopWatching) { stopWatching(); stopWatching = null; }
+    // whichever route delivered the answer, the other one can stop looking
+    stopRoomWatch();
+    if (myRoom) { forgetRoom(myRoom); myRoom = null; }
     return id;
+  }
+
+  // ── room codes: signalling through /api/data when a server is there ────────
+  /* A camera handshake is wonderful on two phones and miserable on a desktop
+   * with no webcam. But every server-backed deployment already carries a
+   * key-value store — the preview, the VM, Cloud Run + Firestore — and
+   * signalling is nothing more than leaving a note somewhere both sides can
+   * reach. So a "room" is one key:
+   *
+   *     rooms/<CODE> = {offer, answer, created}
+   *
+   * The host claims a code and polls for the answer; the joiner types the code
+   * and writes one back. Nothing new to deploy, no camera, and it works the same
+   * on the VM (files) and Cloud Run (Firestore) because the API is the same.
+   * Static hosting has no such store — that is exactly when the QR path earns
+   * its keep, and `rooms.available()` says which you've got.
+   */
+  var ROOM_KEY = "rooms/";
+  var ROOM_TTL_MS = 15 * 60 * 1000;
+  var ROOM_POLL_MS = 1500;
+  var ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no O/0/I/1
+  var apiState = null, roomTimer = null, myRoom = null;
+
+  async function apiAvailable() {
+    if (apiState !== null) return apiState;
+    try {
+      var r = await fetch("api/data", { cache: "no-store", credentials: "same-origin" });
+      // 401 still means a server is answering — it just wants a sign-in first,
+      // and the session cookie rides along on these same requests
+      apiState = r.ok || r.status === 401 || r.status === 403;
+    } catch (e) { apiState = false; }
+    return apiState;
+  }
+
+  function newCode(len) {
+    var out = "", n = len || 4;
+    var rnd = crypto.getRandomValues(new Uint8Array(n));
+    for (var i = 0; i < n; i++) out += ROOM_ALPHABET[rnd[i] % ROOM_ALPHABET.length];
+    return out;
+  }
+
+  async function readRoom(code) {
+    var r = await fetch("api/data/" + ROOM_KEY + code,
+                        { cache: "no-store", credentials: "same-origin" });
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error(r.status === 401
+      ? "sign in first — rooms live in this site's data store" : "room lookup failed");
+    var rec = await r.json();
+    if (!rec || !rec.offer) return null;
+    if (Date.now() - (rec.created || 0) > ROOM_TTL_MS) return null;   // stale
+    return rec;
+  }
+
+  async function writeRoom(code, rec) {
+    var r = await fetch("api/data/" + ROOM_KEY + code, {
+      method: "PUT", credentials: "same-origin", body: JSON.stringify(rec) });
+    if (!r.ok) throw new Error(r.status === 401
+      ? "sign in first — rooms live in this site's data store" : "could not save the room");
+  }
+
+  function forgetRoom(code) {
+    // the note has been read; leaving it lying around only invites confusion
+    try { fetch("api/data/" + ROOM_KEY + code,
+                { method: "DELETE", credentials: "same-origin" }); } catch (e) {}
+  }
+
+  async function createRoom() {
+    if (!(await apiAvailable()))
+      throw new Error("this site has no server, so it can't hold room codes — share the link or QR instead");
+    var inv = await host();
+    var code = "";
+    for (var tries = 0; tries < 5 && !code; tries++) {
+      var candidate = newCode(4);
+      if (!(await readRoom(candidate))) code = candidate;      // free, or expired
+    }
+    if (!code) throw new Error("couldn't find a free room code — try again");
+    await writeRoom(code, { offer: inv.code, answer: null, created: Date.now() });
+    myRoom = code;
+
+    if (roomTimer) clearInterval(roomTimer);
+    var until = Date.now() + ROOM_TTL_MS;
+    roomTimer = setInterval(async function () {
+      if (Date.now() > until) return stopRoomWatch();
+      try {
+        var rec = await readRoom(code);
+        if (rec && rec.answer) {
+          stopRoomWatch();
+          await accept(rec.answer);
+          forgetRoom(code);
+        }
+      } catch (e) { /* a blip shouldn't end the wait */ }
+    }, ROOM_POLL_MS);
+
+    return { room: code, code: inv.code, url: inv.url, id: inv.id,
+             localOnly: inv.localOnly };
+  }
+
+  function stopRoomWatch() {
+    if (roomTimer) { clearInterval(roomTimer); roomTimer = null; }
+  }
+
+  async function joinRoom(code) {
+    code = String(code || "").trim().toUpperCase();
+    if (!code) throw new Error("enter a room code");
+    if (!(await apiAvailable()))
+      throw new Error("this site has no server, so room codes don't work here — paste the invite link instead");
+    var rec = await readRoom(code);
+    if (!rec) throw new Error('no room "' + code + '" — check the code, or ask for a new one');
+    var ans = await join(rec.offer);
+    await writeRoom(code, { offer: rec.offer, answer: ans.code, created: rec.created });
+    return ans;
   }
 
   // ── getting the answer back to the host ────────────────────────────────────
@@ -452,13 +566,31 @@
     host: host,
     join: join,
     accept: accept,
+    /** Room codes, when this site has a server to hold them. `available()` is
+     *  what a game should branch on — it decides whether to offer a typed code
+     *  or fall back to the QR/link handshake. */
+    rooms: {
+      available: apiAvailable,
+      create: createRoom,
+      join: joinRoom,
+      current: function () { return myRoom; },
+      cancel: function () {
+        stopRoomWatch();
+        if (myRoom) { forgetRoom(myRoom); myRoom = null; }
+      },
+    },
     send: function (obj) { broadcast({ t: "msg", d: obj }); },
     setState: function (s) {
       api.state = s;
       if (api.isHost) broadcast({ t: "state", s: s });
       emit("state", s, "self");
     },
-    disconnect: function () { Object.keys(peers).forEach(function (id) { drop(id, "left"); }); },
+    disconnect: function () {
+      stopRoomWatch();
+      if (myRoom) { forgetRoom(myRoom); myRoom = null; }
+      if (stopWatching) { stopWatching(); stopWatching = null; }
+      Object.keys(peers).forEach(function (id) { drop(id, "left"); });
+    },
     // exposed for the test suite — the packing is the part worth testing
     _pack: pack, _unpack: unpack, _buildSdp: buildSdp, _readSdp: readSdp,
   };
@@ -518,6 +650,27 @@
       : '<span style="color:#6b7280">no players yet</span>';
   }
 
+  /* The panel is re-rendered every time it opens, so its event handlers are
+   * registered ONCE here against whichever element is currently mounted.
+   * Registering them inside render() instead added a fresh set on every open,
+   * each closed over a detached node — a leak that also fired the same message
+   * N times after the panel had been opened N times. */
+  var panel = { el: null, body: null, onConnected: null, showHost: null };
+  api.on("open", function () {
+    if (!panel.el) return;
+    renderPeers(panel.el);
+    kdock.msg(panel.el, "player connected ✓");
+    if (panel.onConnected) panel.onConnected();
+  });
+  api.on("close", function (id, why) {
+    if (!panel.el) return;
+    renderPeers(panel.el);
+    kdock.msg(panel.el, "player " + id + " left (" + why + ")", true);
+  });
+  api.on("error", function (e) {
+    if (panel.el) kdock.msg(panel.el, e.message || String(e), true);
+  });
+
   kdock.add({
     id: "multiplayer", emoji: "🎮", label: "play", title: "Local multiplayer",
     render: function (el) {
@@ -525,12 +678,8 @@
         '<div id="kmp-body"></div><div id="kmp-peers" style="margin:.4rem 0"></div>' +
         '<div class="k-msg"></div><textarea style="display:none"></textarea>');
       var body = el.querySelector("#kmp-body");
+      panel.el = el; panel.body = body;
       renderPeers(el);
-      api.on("open", function () { renderPeers(el); kdock.msg(el, "player connected ✓"); });
-      api.on("close", function (id, why) {
-        renderPeers(el);
-        kdock.msg(el, "player " + id + " left (" + why + ")", true);
-      });
 
       function insecureNote() {
         return window.isSecureContext ? "" :
@@ -539,61 +688,91 @@
           "works; in-page scanning does not.</div>";
       }
 
+      function onConnected() {
+        body.innerHTML = '<div class="k-note">Connected. Add another player for ' +
+          "the next one.</div>" +
+          '<button class="k-btn primary" id="kmp-again">Add another player</button>';
+        var again = el.querySelector("#kmp-again");
+        if (again) again.addEventListener("click", showHost);
+      }
+      panel.onConnected = onConnected;
+
       async function showHost() {
-        body.innerHTML = '<div class="k-note">Generating invitation…</div>';
+        body.innerHTML = '<div class="k-note">Opening a game…</div>';
         try {
-          var inv = await api.host();
-          body.innerHTML = qrBlock(inv.url,
-            "Point a phone camera at this. It opens the game on their device.") +
-            copyRow("Copy invite link", inv.url) +
-            '<button class="k-btn" id="kmp-scan">I have their answer code…</button>' +
-            (inv.localOnly
-              ? '<div class="k-note" style="color:#b45309">This page is on ' +
-                "<b>localhost</b>, so that link only opens on this machine. Reach " +
-                "the preview by its network address (or deploy the site) before " +
-                "anyone else can scan in.</div>"
-              : "") +
-            insecureNote();
+          // Prefer a typed room code when this site has a server to hold one:
+          // it's the only route that needs no camera at either end.
+          if (await api.rooms.available()) {
+            var r = await api.rooms.create();
+            body.innerHTML =
+              '<div style="text-align:center;margin:.3rem 0 .6rem">' +
+              '<div class="k-note" style="margin:0">room code</div>' +
+              '<div style="font:700 2.1rem/1.1 ui-monospace,monospace;letter-spacing:.18em;' +
+              'color:#111827">' + r.room + "</div></div>" +
+              '<div class="k-note">Other players open this site and enter that code. ' +
+              "No camera needed.</div>" +
+              qrBlock(r.url, "…or point a phone camera at this to skip the typing.") +
+              copyRow("Copy invite link", r.url) +
+              '<button class="k-btn" id="kmp-scan">Paste an answer code instead…</button>' +
+              (r.localOnly ? localNote() : "");
+          } else {
+            var inv = await api.host();
+            body.innerHTML = qrBlock(inv.url,
+              "Point a phone camera at this. It opens the game on their device.") +
+              copyRow("Copy invite link", inv.url) +
+              '<button class="k-btn" id="kmp-scan">Paste an answer code instead…</button>' +
+              '<div class="k-note">This site is statically hosted, so there is no ' +
+              "server to keep room codes in — send the link any way you like " +
+              "(message, email) and they can paste it.</div>" +
+              (inv.localOnly ? localNote() : "") + insecureNote();
+          }
           wireCopy(el);
           renderPeers(el);
-          // host() is already watching for the answer; just react to the result
-          api.on("open", function () {
-            body.innerHTML = '<div class="k-note">Connected. Tap “Add another ' +
-              'player” for the next one.</div>' +
-              '<button class="k-btn primary" id="kmp-again">Add another player</button>';
-            var again = el.querySelector("#kmp-again");
-            if (again) again.addEventListener("click", showHost);
-          });
-          api.on("error", function (e) { kdock.msg(el, e.message || String(e), true); });
-          el.querySelector("#kmp-scan").addEventListener("click", function () {
-            showAnswerEntry();
-          });
+          el.querySelector("#kmp-scan").addEventListener("click", showAnswerEntry);
         } catch (e) {
           body.innerHTML = "";
           kdock.msg(el, e.message || String(e), true);
         }
       }
 
+      function localNote() {
+        return '<div class="k-note" style="color:#b45309">This page is on ' +
+          "<b>localhost</b>, so that link only opens on this machine. Reach the " +
+          "preview by its network address (or deploy the site) first.</div>";
+      }
+
       function showAnswerEntry() {
+        var canScan = scannerAvailable();
+        var canRead = !!(navigator.clipboard && navigator.clipboard.readText) &&
+                      window.isSecureContext;
         body.innerHTML = '<div id="kmp-cam"></div>' +
-          '<div class="k-note">Scan their answer code, or paste it here:</div>' +
-          '<textarea id="kmp-paste" placeholder="paste the answer code"></textarea>' +
+          '<div class="k-note">' + (canScan
+            ? "Hold their answer code up to the camera, or paste it:"
+            : "Ask them to send you their answer code, then paste it here:") + "</div>" +
+          '<textarea id="kmp-paste" placeholder="paste the answer code or link"></textarea>' +
+          (canRead ? '<button class="k-btn" id="kmp-read">Paste from clipboard</button>' : "") +
           '<button class="k-btn primary" id="kmp-use">Connect</button>' +
-          '<button class="k-btn" id="kmp-back">Back to the invitation</button>';
+          '<button class="k-btn" id="kmp-back">Back</button>';
+        var paste = el.querySelector("#kmp-paste");
         el.querySelector("#kmp-back").addEventListener("click", showHost);
-        el.querySelector("#kmp-use").addEventListener("click", async function () {
+
+        var connect = async function (text) {
           try {
-            await api.accept(codeFromText(el.querySelector("#kmp-paste").value));
+            await api.accept(codeFromText(text));
             kdock.msg(el, "connecting…");
           } catch (e) { kdock.msg(el, e.message || String(e), true); }
+        };
+        el.querySelector("#kmp-use").addEventListener("click", function () {
+          connect(paste.value);
         });
-        if (scannerAvailable()) {
-          scanWithCamera(el.querySelector("#kmp-cam"), async function (text) {
-            try {
-              await api.accept(codeFromText(text));
-              kdock.msg(el, "connecting…");
-            } catch (e) { kdock.msg(el, e.message || String(e), true); }
-          }).catch(function (e) { kdock.msg(el, "camera unavailable: " + e.message, true); });
+        var read = el.querySelector("#kmp-read");
+        if (read) read.addEventListener("click", async function () {
+          try { paste.value = await navigator.clipboard.readText(); connect(paste.value); }
+          catch (e) { kdock.msg(el, "clipboard not readable — paste it by hand", true); }
+        });
+        if (canScan) {
+          scanWithCamera(el.querySelector("#kmp-cam"), function (text) { connect(text); })
+            .catch(function (e) { kdock.msg(el, "camera unavailable: " + e.message, true); });
         }
       }
 
@@ -611,27 +790,57 @@
         }
       }
 
+      async function showJoinEntry() {
+        var hasRooms = await api.rooms.available();
+        body.innerHTML =
+          (hasRooms
+            ? '<div class="k-note">Enter the host\'s room code:</div>' +
+              '<input id="kmp-room" placeholder="CODE" maxlength="6" ' +
+              'style="width:100%;box-sizing:border-box;margin:.25rem 0;padding:.5rem;' +
+              'font:700 1.3rem/1 ui-monospace,monospace;text-align:center;' +
+              "letter-spacing:.2em;text-transform:uppercase;background:#fff;color:#111827;" +
+              'border:1px solid #d1d5db;border-radius:8px">' +
+              '<button class="k-btn primary" id="kmp-room-go">Join room</button>' +
+              '<div class="k-note" style="margin-top:.6rem">…or paste an invite link:</div>'
+            : '<div class="k-note">Paste the invite link the host sent you:</div>') +
+          '<textarea id="kmp-join-code" placeholder="paste the invite link or code"></textarea>' +
+          '<button class="k-btn" id="kmp-join-go">Join with link</button>';
+        var roomGo = el.querySelector("#kmp-room-go");
+        if (roomGo) {
+          var input = el.querySelector("#kmp-room");
+          input.focus();
+          var go = async function () {
+            body.innerHTML = '<div class="k-note">Looking for that room…</div>';
+            try {
+              var ans = await api.rooms.join(input.value);
+              body.innerHTML = '<div class="k-note">Found it — connecting…</div>' +
+                qrBlock(ans.url, "If it stalls, show this to the host instead.");
+            } catch (e) {
+              await showJoinEntry();
+              kdock.msg(el, e.message || String(e), true);
+            }
+          };
+          roomGo.addEventListener("click", go);
+          input.addEventListener("keydown", function (e) { if (e.key === "Enter") go(); });
+        }
+        el.querySelector("#kmp-join-go").addEventListener("click", function () {
+          showJoin(codeFromText(el.querySelector("#kmp-join-code").value));
+        });
+      }
+
       if (offerInUrl) {
         history.replaceState(null, "", baseUrl());
         showJoin(offerInUrl[1]);
       } else if (api.peers.length) {
-        body.innerHTML = '<div class="k-note">In a game.</div>' +
-          '<button class="k-btn primary" id="kmp-again">Add another player</button>';
-        el.querySelector("#kmp-again").addEventListener("click", showHost);
+        onConnected();
       } else {
         body.innerHTML =
           '<button class="k-btn primary" id="kmp-create">Create game</button>' +
-          '<button class="k-btn" id="kmp-manual">Join with a code…</button>' +
-          '<div class="k-note">Everyone plays over a direct connection between ' +
-          "browsers — no server, no internet needed beyond the same Wi-Fi.</div>";
+          '<button class="k-btn" id="kmp-manual">Join a game…</button>' +
+          '<div class="k-note">Players connect directly, browser to browser — no ' +
+          "game server, and no internet needed beyond the same Wi-Fi.</div>";
         el.querySelector("#kmp-create").addEventListener("click", showHost);
-        el.querySelector("#kmp-manual").addEventListener("click", function () {
-          body.innerHTML = '<textarea id="kmp-join-code" placeholder="paste the invite code"></textarea>' +
-            '<button class="k-btn primary" id="kmp-join-go">Join</button>';
-          el.querySelector("#kmp-join-go").addEventListener("click", function () {
-            showJoin(codeFromText(el.querySelector("#kmp-join-code").value));
-          });
-        });
+        el.querySelector("#kmp-manual").addEventListener("click", showJoinEntry);
       }
     },
   });

@@ -3,6 +3,15 @@
     "url": "https://tandylew.github.io/pong/",
     "repo": "tandylew/pong",
     "branch": "gh-pages",
-    "checked": 1786495093
+    "live": true,
+    "checked": 1786661854
+  },
+  "run": {
+    "url": "https://pong-czr2y227cq-uw.a.run.app",
+    "project": "karaoke-505120",
+    "service": "pong",
+    "region": "us-west1",
+    "live": true,
+    "checked": 1786661821
   }
 }

@@ -165,14 +165,34 @@
 
   $("btnHost").addEventListener("click", () => startHost());
 
-  // There's no room code any more — the invitation IS the QR. This is the
-  // fallback for anyone who can't point a camera at the other screen.
+  // One box takes either: a short room code (server-backed sites) or a pasted
+  // invite link (static hosting). Telling them apart is easy enough that asking
+  // the player which one they have would be rude.
   $("btnJoin").addEventListener("click", async () => {
     const raw = ($("joinCode").value || "").trim();
-    if (!raw) { msgEl.textContent = "Paste the host's invite code or link first."; return; }
-    const m = /[#&]kmp=([A-Za-z0-9\-_]+)/.exec(raw);
-    await startGuest(m ? m[1] : raw);
+    if (!raw) { msgEl.textContent = "Enter a room code, or paste the host's link."; return; }
+    if (!(await netReady())) return;
+    const link = /[#&]kmp=([A-Za-z0-9\-_]+)/.exec(raw);
+    if (link) return startGuest(link[1]);
+    if (/^[A-Za-z0-9]{4,6}$/.test(raw)) return joinByRoom(raw);
+    await startGuest(raw);                     // a bare invite code
   });
+
+  async function joinByRoom(code) {
+    wireNet();
+    mirrored = true; placeCamera();
+    state.mode = "guest";
+    resetMatch(); state.running = false;
+    showGame();
+    netEl.textContent = "Looking for room " + code.toUpperCase() + "…";
+    try {
+      const ans = await kmp.rooms.join(code);
+      netEl.textContent = "Room found — connecting…";
+      qrPanel(ans.url, "Connecting…", "If this stalls, show the code to the host.");
+    } catch (e) {
+      showMenu(e.message || String(e));
+    }
+  }
 
   $("btnRematch").addEventListener("click", () => {
     if (state.mode === "local") { state.serve = -state.serve; resetMatch(); state.running = true; showGame(); }
@@ -192,9 +212,11 @@
   }
   addEventListener("beforeunload", stopNet);
 
-  function qrPanel(url, heading, caption) {
+  function qrPanel(url, heading, caption, bigCode) {
     const svg = window.kqr ? kqr.svg(url, 230) : null;
     $("qrTitle").textContent = heading;
+    $("qrBig").textContent = bigCode || "";
+    $("qrBig").style.display = bigCode ? "block" : "none";
     $("qrCaption").textContent = caption;
     $("qrCode").innerHTML = svg ||
       "<p class='sub'>Couldn't draw the code — use the link button below.</p>";
@@ -275,12 +297,23 @@
     showGame();
     netEl.textContent = "Opening a room…";
     try {
-      const inv = await kmp.host();
-      netEl.textContent = "Waiting for an opponent to scan in…";
-      qrPanel(inv.url, "Scan to join",
-        inv.localOnly
-          ? "This page is on localhost, so the code only opens on this machine — deploy it or use the network address."
-          : "Point the other player's phone camera at this. Their device shows a code back; scan that with yours.");
+      // A typed room code needs no camera at either end, so it wins whenever
+      // this site has a server to keep one in. On static hosting there isn't
+      // one, and the QR/link handshake carries the introduction instead.
+      if (await kmp.rooms.available()) {
+        const r = await kmp.rooms.create();
+        netEl.textContent = "Room " + r.room + " — waiting for an opponent";
+        qrPanel(r.url, "Room " + r.room,
+          "They open this site on any device and type " + r.room +
+          " — or point a phone camera at the code to skip the typing.", r.room);
+      } else {
+        const inv = await kmp.host();
+        netEl.textContent = "Waiting for an opponent…";
+        qrPanel(inv.url, "Scan or share to join",
+          inv.localOnly
+            ? "This page is on localhost, so the link only opens on this machine — deploy it or use the network address."
+            : "Point their phone camera at this, or send them the link. On a computer, paste the link into Join.");
+      }
     } catch (e) {
       showMenu(e.message || String(e));
     }
