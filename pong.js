@@ -1,15 +1,18 @@
-/* pong.js — 3D Pong (Three.js), local 2-player + online multiplayer.
+/* pong.js — 3D Pong (Three.js), local 2-player + same-room multiplayer.
  *
- * This deploys to GitHub Pages — plain static hosting, nobody answering
- * /api/data — so kstore has no shared backend to poll and localStorage
- * is private per browser. That rules out any store-and-poll approach for
- * crossing devices. Instead, online play uses real peer-to-peer WebRTC
- * (via PeerJS's free public signaling broker, id.peerjs.com) — the room
- * code IS the PeerJS id, the two browsers find each other through that
- * cloud broker just long enough to open a direct data channel, and all
- * game state after that flows browser-to-browser, no backend involved.
- * Needs a network path between the two peers (works on most home wifi;
- * strict corporate/school firewalls without STUN egress can block it).
+ * Online play is real peer-to-peer WebRTC over karaoke-multiplayer.js: the
+ * host shows a QR code, the other player scans it with an ordinary phone
+ * camera, and their answer travels back the same way. After that every byte
+ * of game state goes browser-to-browser with nothing in between.
+ *
+ * This replaced a PeerJS version. PeerJS looked simpler but needs two things
+ * this doesn't have: a script from a CDN, and its cloud broker at
+ * id.peerjs.com to introduce the two browsers — so "no backend" was never
+ * quite true, and a blocked CDN or a busy broker meant no game. The QR
+ * handshake carries the introduction itself.
+ *
+ * Host is authoritative: it simulates the ball and owns the score, the guest
+ * sends only its paddle position. Losing the opponent pauses rather than ends.
  */
 (function () {
   "use strict";
@@ -160,145 +163,152 @@
     netEl.textContent = "Local 2-player — Left: W/S · Right: ↑/↓";
   });
 
-  $("btnHost").addEventListener("click", async () => {
-    const code = genCode();
-    history.replaceState(null, "", "?room=" + code);
-    await startHost(code);
-  });
+  $("btnHost").addEventListener("click", () => startHost());
 
+  // There's no room code any more — the invitation IS the QR. This is the
+  // fallback for anyone who can't point a camera at the other screen.
   $("btnJoin").addEventListener("click", async () => {
-    const code = ($("joinCode").value || "").trim().toUpperCase();
-    if (!code) { msgEl.textContent = "Enter a room code first."; return; }
-    history.replaceState(null, "", "?room=" + code);
-    await startGuest(code);
+    const raw = ($("joinCode").value || "").trim();
+    if (!raw) { msgEl.textContent = "Paste the host's invite code or link first."; return; }
+    const m = /[#&]kmp=([A-Za-z0-9\-_]+)/.exec(raw);
+    await startGuest(m ? m[1] : raw);
   });
 
   $("btnRematch").addEventListener("click", () => {
     if (state.mode === "local") { state.serve = -state.serve; resetMatch(); state.running = true; showGame(); }
+    else if (connected) { state.serve = -state.serve; resetMatch(); state.running = true; showGame(); }
     else showMenu();
   });
   $("btnMenu").addEventListener("click", () => showMenu());
+  $("qrClose").addEventListener("click", () => hideQr());
 
-  function genCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let s = "";
-    for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    return s;
-  }
+  // ---------- networking (WebRTC data channel via karaoke-multiplayer.js) ----
+  let netTimer = null, connected = false;
 
-  // prefill join code from URL, e.g. ?room=AB12
-  const urlRoom = new URLSearchParams(location.search).get("room");
-  if (urlRoom) $("joinCode").value = urlRoom.toUpperCase();
-
-  // ---------- networking (WebRTC data channel via PeerJS) ----------
-  // Namespaced so this game's room codes don't collide with other apps
-  // sharing the same public broker's global id space.
-  const PEER_NS = "kpong3d-";
-  let peer = null, conn = null, netTimer = null, roomCode = null, joinTimeout = null;
-
-  function teardownPeer() {
+  function stopNet() {
     if (netTimer) { clearInterval(netTimer); netTimer = null; }
-    if (joinTimeout) { clearTimeout(joinTimeout); joinTimeout = null; }
-    if (conn) { try { conn.close(); } catch (e) {} conn = null; }
-    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
-    roomCode = null;
+    connected = false;
+    if (window.kmp) kmp.disconnect();
   }
-  function stopNet() { teardownPeer(); }
-  addEventListener("beforeunload", teardownPeer);
+  addEventListener("beforeunload", stopNet);
 
-  function wireConnection(onOpen) {
-    conn.on("open", () => {
+  function qrPanel(url, heading, caption) {
+    const svg = window.kqr ? kqr.svg(url, 230) : null;
+    $("qrTitle").textContent = heading;
+    $("qrCaption").textContent = caption;
+    $("qrCode").innerHTML = svg ||
+      "<p class='sub'>Couldn't draw the code — use the link button below.</p>";
+    $("qrLink").onclick = async () => {
+      try { await navigator.clipboard.writeText(url); $("msg").textContent = "Link copied."; }
+      catch (e) {
+        // clipboard needs a secure context; plain HTTP falls back to selection
+        const ta = $("qrFallback");
+        ta.style.display = "block"; ta.value = url; ta.select();
+        $("msg").textContent = "Copy the link from the box.";
+      }
+    };
+    $("qrOverlay").style.display = "grid";
+  }
+  function hideQr() { $("qrOverlay").style.display = "none"; }
+
+  function wireNet() {
+    if (wireNet.done) return;
+    wireNet.done = true;
+
+    kmp.on("open", () => {
+      connected = true;
+      hideQr();
       state.running = true;
-      netEl.textContent = "Room " + roomCode + " — connected";
+      netEl.textContent = "Connected — playing";
       if (netTimer) clearInterval(netTimer);
       netTimer = setInterval(sendState, SYNC_MS);
-      if (onOpen) onOpen();
     });
-    conn.on("data", (data) => {
+
+    kmp.on("data", (d) => {
       if (state.mode === "host") {
-        netTarget.zR = data.z;
+        netTarget.zR = d.z;
       } else if (state.mode === "guest") {
-        netTarget.zL = data.zL; netTarget.bx = data.bx; netTarget.bz = data.bz;
-        state.scoreL = data.sL; state.scoreR = data.sR;
+        netTarget.zL = d.zL; netTarget.bx = d.bx; netTarget.bz = d.bz;
+        state.scoreL = d.sL; state.scoreR = d.sR;
       }
     });
-    conn.on("close", () => {
+
+    // A dropped opponent pauses the match instead of ending it, so the host can
+    // put a fresh code up and whoever wandered off can walk back in.
+    kmp.on("close", () => {
+      connected = false;
       state.running = false;
-      netEl.textContent = state.mode === "host" ? "Opponent disconnected." : "Host disconnected.";
       if (netTimer) { clearInterval(netTimer); netTimer = null; }
-      conn = null;
+      netEl.textContent = state.mode === "host"
+        ? "Opponent left — tap Create Room for a new code."
+        : "Host left. Back to the menu.";
+      if (state.mode === "guest") setTimeout(() => showMenu("The host disconnected."), 1200);
     });
-    conn.on("error", () => {
-      netEl.textContent = "Connection error.";
-    });
+
+    kmp.on("error", (e) => { $("msg").textContent = e.message || String(e); });
   }
 
   function sendState() {
-    if (!conn || !conn.open) return;
+    if (!connected) return;
     if (state.mode === "host") {
-      conn.send({ zL: state.zL, bx: state.bx, bz: state.bz, sL: state.scoreL, sR: state.scoreR });
+      kmp.send({ zL: state.zL, bx: state.bx, bz: state.bz, sL: state.scoreL, sR: state.scoreR });
     } else if (state.mode === "guest") {
-      conn.send({ z: state.zR });
+      kmp.send({ z: state.zR });
     }
   }
 
-  async function startHost(code) {
+  // The feature modules are injected asynchronously, so they may not exist yet
+  // when this file first runs — wait for the loader rather than poll for globals.
+  async function netReady() {
+    if (window.kready) { try { await window.kready; } catch (e) {} }
+    if (window.kmp && window.kqr) return true;
+    showMenu("Online play needs the multiplayer feature turned on for this site.");
+    return false;
+  }
+
+  async function startHost() {
+    if (!(await netReady())) return;
+    wireNet();
     mirrored = false; placeCamera();
-    roomCode = code; state.mode = "host";
+    state.mode = "host";
     state.serve = 1; resetMatch(); state.running = false;
     showGame();
-    netEl.textContent = "Room " + code + " — opening…";
-
-    peer = new Peer(PEER_NS + code);
-    peer.on("open", () => {
-      netEl.textContent = "Room " + code + " — waiting for opponent… (share via the dock's share button)";
-    });
-    peer.on("connection", (c) => {
-      if (conn) { try { conn.close(); } catch (e) {} } // newest challenger wins
-      conn = c;
-      wireConnection();
-    });
-    peer.on("error", (err) => {
-      if (err.type === "unavailable-id") {
-        // vanishingly rare with a 4-char code, but don't get stuck on it
-        const fresh = genCode();
-        history.replaceState(null, "", "?room=" + fresh);
-        teardownPeer();
-        startHost(fresh);
-      } else {
-        netEl.textContent = "Couldn't open a room (" + err.type + "). Check your connection and try again.";
-      }
-    });
+    netEl.textContent = "Opening a room…";
+    try {
+      const inv = await kmp.host();
+      netEl.textContent = "Waiting for an opponent to scan in…";
+      qrPanel(inv.url, "Scan to join",
+        inv.localOnly
+          ? "This page is on localhost, so the code only opens on this machine — deploy it or use the network address."
+          : "Point the other player's phone camera at this. Their device shows a code back; scan that with yours.");
+    } catch (e) {
+      showMenu(e.message || String(e));
+    }
   }
 
   async function startGuest(code) {
+    if (!(await netReady())) return;
+    wireNet();
     mirrored = true; placeCamera();
-    roomCode = code; state.mode = "guest";
+    state.mode = "guest";
     resetMatch(); state.running = false;
     showGame();
-    netEl.textContent = "Joining room " + code + "…";
+    netEl.textContent = "Answering the invitation…";
+    try {
+      const ans = await kmp.join(code);
+      qrPanel(ans.url, "Show this to the host",
+        "Their camera reads it and the match starts. It opens a tab on their phone that closes itself.");
+    } catch (e) {
+      showMenu(e.message || String(e));
+    }
+  }
 
-    peer = new Peer();
-    peer.on("open", () => {
-      conn = peer.connect(PEER_NS + code, { reliable: true });
-      wireConnection();
-      conn.on("error", () => {}); // surfaced via peer's "error" below
-      joinTimeout = setTimeout(() => {
-        if (!state.running) {
-          const msg = 'No room "' + code + '" found. Check the code (or ask the host to create one).';
-          teardownPeer(); showMenu(msg);
-        }
-      }, 10000);
-    });
-    peer.on("error", (err) => {
-      if (err.type === "peer-unavailable") {
-        const msg = 'No room "' + code + '" found. Check the code (or ask the host to create one).';
-        teardownPeer(); showMenu(msg);
-      } else {
-        const msg = "Couldn't connect (" + err.type + "). Check your connection and try again.";
-        teardownPeer(); showMenu(msg);
-      }
-    });
+  // Arriving from a scanned invitation: the URL carries the offer, so skip the
+  // menu entirely and go straight to answering it.
+  const invite = /[#&]kmp=([A-Za-z0-9\-_]+)/.exec(location.hash || "");
+  if (invite) {
+    history.replaceState(null, "", location.pathname + location.search);
+    startGuest(invite[1]);
   }
 
   // interpolation targets for values arriving over the network
@@ -409,6 +419,4 @@
   }
 
   requestAnimationFrame(frame);
-
-  if (urlRoom) showMenu('Room "' + urlRoom + '" is ready to join below.');
 })();
