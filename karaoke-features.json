@@ -4,5 +4,6 @@
   "backup": false,
   "pwa": false,
   "qr": true,
-  "stats": false
+  "stats": false,
+  "multiplayer": true
 }

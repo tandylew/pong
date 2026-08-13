@@ -1,6 +1,6 @@
 {
-  "name": "pong",
-  "short_name": "pong",
+  "name": "pong 3D",
+  "short_name": "pong 3D",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

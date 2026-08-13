@@ -1,11 +1,18 @@
-/* karaoke-qr.js — share this page as a QR code. Static + offline.
+/* karaoke-qr.js — QR codes, drawn here. Static + offline.
  *
  * Self-contained QR encoder (no library, no network): byte mode, error
- * correction level L, versions 1–5 (up to 106 characters — plenty for a URL).
- * Renders as inline SVG, so it prints and scales cleanly.
+ * correction level L, versions 1–20 — up to 861 bytes.
+ *
+ * It used to stop at version 5 (106 characters), which is plenty for a URL and
+ * nowhere near enough for karaoke-multiplayer.js, whose compacted WebRTC offers
+ * run a few hundred bytes. Going past 5 means three things the small versions
+ * don't need, and all three are here: multiple error-correction BLOCKS with
+ * interleaving (from v6), the 18-bit VERSION INFO fields (from v7), and a
+ * 16-bit character count instead of 8 (from v10).
  *
  * Exposes window.kqr.matrix(text[, forceMask]) → array of 0/1 rows (used by
- * the test suite), and window.kqr.svg(text) → SVG string.
+ * the test suite), window.kqr.svg(text[, px]) → SVG string, and
+ * window.kqr.capacity() → the largest payload that will encode.
  *
  * Requires karaoke-features.js (kdock) for the dock button.
  */
@@ -45,9 +52,56 @@
     return res.slice(data.length);
   }
 
-  // ── symbol tables (EC level L, versions 1–5 — all single-block) ───────────
-  var DATA_CW = [19, 34, 55, 80, 108];      // data codewords per version
-  var EC_CW = [7, 10, 15, 20, 26];          // EC codewords per version
+  // ── symbol tables, error-correction level L, versions 1–20 ────────────────
+  // [EC codewords per block, group-1 blocks, group-1 data cw, group-2 blocks,
+  //  group-2 data cw]. Group 2's blocks hold exactly one more codeword than
+  //  group 1's; that difference is why interleaving has to skip.
+  var SPEC = [
+    [7, 1, 19, 0, 0], [10, 1, 34, 0, 0], [15, 1, 55, 0, 0], [20, 1, 80, 0, 0],
+    [26, 1, 108, 0, 0], [18, 2, 68, 0, 0], [20, 2, 78, 0, 0], [24, 2, 97, 0, 0],
+    [30, 2, 116, 0, 0], [18, 2, 68, 2, 69], [20, 4, 81, 0, 0], [24, 2, 92, 2, 93],
+    [26, 4, 107, 0, 0], [30, 3, 115, 1, 116], [22, 5, 87, 1, 88],
+    [24, 5, 98, 1, 99], [28, 1, 107, 5, 108], [30, 5, 120, 1, 121],
+    [28, 3, 113, 4, 114], [28, 3, 107, 5, 108],
+  ];
+  // alignment-pattern centre coordinates per version (v1 has none)
+  var ALIGN = [
+    [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42],
+    [6, 26, 46], [6, 28, 50], [6, 30, 54], [6, 32, 58], [6, 34, 62],
+    [6, 26, 46, 66], [6, 26, 48, 70], [6, 26, 50, 74], [6, 30, 54, 78],
+    [6, 30, 56, 82], [6, 30, 58, 86], [6, 34, 62, 90],
+  ];
+
+  function dataCw(ver) {                    // total data codewords for a version
+    var s = SPEC[ver - 1];
+    return s[1] * s[2] + s[3] * s[4];
+  }
+  function countBits(ver) { return ver < 10 ? 8 : 16; }   // byte-mode length field
+  function capacityFor(ver) { return dataCw(ver) - 2 - (countBits(ver) >> 3) + 1; }
+
+  /** Split the data codewords into blocks, add each block's EC, and interleave.
+   *  Interleaving is what makes a burst of damage land across many blocks
+   *  instead of destroying one — so it is the whole point of blocks. */
+  function interleave(cw, ver) {
+    var s = SPEC[ver - 1], ecLen = s[0];
+    var sizes = [];
+    for (var i = 0; i < s[1]; i++) sizes.push(s[2]);
+    for (var j = 0; j < s[3]; j++) sizes.push(s[4]);
+    var blocks = [], at = 0, maxData = 0;
+    for (var b = 0; b < sizes.length; b++) {
+      var d = cw.slice(at, at + sizes[b]);
+      at += sizes[b];
+      maxData = Math.max(maxData, d.length);
+      blocks.push({ d: d, e: Array.prototype.slice.call(ecc(Uint8Array.from(d), ecLen)) });
+    }
+    var out = [];
+    for (var k = 0; k < maxData; k++)
+      for (var bi = 0; bi < blocks.length; bi++)
+        if (k < blocks[bi].d.length) out.push(blocks[bi].d[k]);
+    for (var m2 = 0; m2 < ecLen; m2++)
+      for (var bj = 0; bj < blocks.length; bj++) out.push(blocks[bj].e[m2]);
+    return out;
+  }
 
   function maskFn(m, r, c) {
     switch (m) {
@@ -107,14 +161,15 @@
   function build(text, forceMask) {
     var bytes = new TextEncoder().encode(text);
     var ver = 0;
-    for (var v = 1; v <= 5; v++) if (bytes.length + 2 <= DATA_CW[v - 1]) { ver = v; break; }
-    if (!ver) return null;                  // too long for version 5-L
-    var cap = DATA_CW[ver - 1], size = 17 + 4 * ver;
+    for (var v = 1; v <= SPEC.length; v++)
+      if (bytes.length <= capacityFor(v)) { ver = v; break; }
+    if (!ver) return null;                  // too long even for version 20-L
+    var cap = dataCw(ver), size = 17 + 4 * ver;
 
-    // -- bit stream: mode(4) + length(8) + data + terminator + pad ------------
+    // -- bit stream: mode(4) + length(8 or 16) + data + terminator + pad ------
     var bits = [];
     function push(val, len) { for (var i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); }
-    push(4, 4); push(bytes.length, 8);
+    push(4, 4); push(bytes.length, countBits(ver));
     for (var b = 0; b < bytes.length; b++) push(bytes[b], 8);
     for (var t = 0; t < 4 && bits.length < cap * 8; t++) bits.push(0);
     while (bits.length % 8) bits.push(0);
@@ -126,7 +181,7 @@
     }
     var PAD = [0xec, 0x11], pi = 0;
     while (cw.length < cap) cw.push(PAD[pi++ & 1]);
-    var all = cw.concat(Array.prototype.slice.call(ecc(Uint8Array.from(cw), EC_CW[ver - 1])));
+    var all = interleave(cw, ver);
 
     // -- function patterns ---------------------------------------------------
     var m = [], fn = [], r, c;
@@ -144,16 +199,26 @@
     }
     for (var ti = 8; ti < size - 8; ti++) { setF(6, ti, ti % 2 === 0 ? 1 : 0); setF(ti, 6, ti % 2 === 0 ? 1 : 0); }
     finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
-    if (ver >= 2) {                         // one alignment pattern, bottom-right
-      var ac = size - 7;
+    // alignment patterns at every pair of centres, minus the three that would
+    // sit on top of a finder
+    var ctr = ALIGN[ver - 1], last = ctr.length - 1;
+    for (var ai = 0; ai <= last; ai++) for (var aj = 0; aj <= last; aj++) {
+      if ((ai === 0 && aj === 0) || (ai === 0 && aj === last) ||
+          (ai === last && aj === 0)) continue;
       for (var ar = -2; ar <= 2; ar++) for (var acc = -2; acc <= 2; acc++)
-        setF(ac + ar, ac + acc, Math.max(Math.abs(ar), Math.abs(acc)) !== 1 ? 1 : 0);
+        setF(ctr[ai] + ar, ctr[aj] + acc,
+             Math.max(Math.abs(ar), Math.abs(acc)) !== 1 ? 1 : 0);
     }
     for (var fi = 0; fi < 9; fi++) {        // reserve the format-info strips
       if (!fn[8][fi]) setF(8, fi, 0);
       if (!fn[fi][8]) setF(fi, 8, 0);
     }
     for (var fj = 0; fj < 8; fj++) { setF(8, size - 1 - fj, 0); setF(size - 1 - fj, 8, 0); }
+    if (ver >= 7)                           // reserve both version-info blocks
+      for (var vi = 0; vi < 18; vi++) {
+        var vr = Math.floor(vi / 3), vc = size - 11 + (vi % 3);
+        setF(vr, vc, 0); setF(vc, vr, 0);
+      }
 
     // -- data placement: zigzag, right to left, skipping the timing column ----
     var bi = 0, dataBits = [];
@@ -191,6 +256,20 @@
         else out[size - 15 + i4][8] = bit;               // …then column 8 bottom
       }
       out[size - 8][8] = 1;                              // always-dark module
+      if (ver >= 7) {
+        // 18-bit version info: 6-bit version + BCH(18,6), generator 0x1F25.
+        // Written twice, mirrored, beside the top-right and bottom-left finders.
+        var vrem = ver;
+        for (var vb = 0; vb < 12; vb++)
+          vrem = (vrem << 1) ^ (((vrem >> 11) & 1) * 0x1f25);
+        var vbits = (ver << 12) | (vrem & 0xfff);
+        for (var vi2 = 0; vi2 < 18; vi2++) {
+          var vbit = (vbits >> vi2) & 1;
+          var vr2 = Math.floor(vi2 / 3), vc2 = size - 11 + (vi2 % 3);
+          out[vr2][vc2] = vbit;
+          out[vc2][vr2] = vbit;
+        }
+      }
       return out;
     }
     if (typeof forceMask === "number") return apply(forceMask);
@@ -215,7 +294,12 @@
       '<path d="' + path + '" fill="#000"/></svg>';
   }
 
-  window.kqr = { matrix: build, svg: svg };
+  window.kqr = {
+    matrix: build, svg: svg,
+    /** Largest payload that will encode, in bytes. Callers that build their own
+     *  payload (karaoke-multiplayer.js) check against this before they bother. */
+    capacity: function () { return capacityFor(SPEC.length); },
+  };
 
   if (!window.kdock) return;
   kdock.add({

@@ -48,6 +48,16 @@
                 background:rgba(11,16,32,.75); backdrop-filter:blur(3px); }
   #winOverlay .panel { text-align:center; }
   #winText { font-size:1.8rem; font-weight:700; }
+
+  /* the handshake overlay — a QR big enough to read from across the room */
+  #qrOverlay { position:fixed; inset:0; display:none; place-items:center; padding:1rem;
+               background:rgba(11,16,32,.88); backdrop-filter:blur(4px); z-index:50; }
+  #qrCode svg { border-radius:10px; display:block; }
+  #qrBig { display:none; text-align:center; font:700 2.6rem/1 ui-monospace,monospace;
+           letter-spacing:.22em; color:var(--accent2); text-indent:.22em; }
+  #qrFallback { display:none; width:100%; height:70px; font:.7rem ui-monospace,monospace;
+                background:#0e1430; color:var(--ink); border:1px solid var(--line);
+                border-radius:8px; padding:.4rem; }
 </style>
 </head>
 <body>
@@ -69,11 +79,13 @@
 
       <button id="btnHost" class="big-btn">Create Room</button>
       <div class="row">
-        <input id="joinCode" placeholder="CODE" maxlength="6">
+        <input id="joinCode" placeholder="ROOM CODE, or paste a link">
         <button id="btnJoin" class="big-btn ghost">Join</button>
       </div>
-      <p class="controls-hint">Host controls the left paddle, guest the right. Move with W/S or ↑/↓.
-        Share the room by opening the dock's share/QR button after creating it.</p>
+      <p class="controls-hint">Host takes the left paddle, guest the right. Move with W/S or ↑/↓.
+        <b>Create Room</b> shows a short code to type — works from any computer or phone,
+        no camera needed. It also puts a QR code up if you'd rather just point a phone at it.
+        Play is browser-to-browser; you both need to be on the same Wi-Fi.</p>
       <div id="msg"></div>
     </div>
   </div>
@@ -83,6 +95,18 @@
       <div id="winText"></div>
       <button id="btnRematch" class="big-btn">Rematch</button>
       <button id="btnMenu" class="big-btn ghost">Main Menu</button>
+    </div>
+  </div>
+
+  <div id="qrOverlay">
+    <div class="panel">
+      <div id="qrTitle" style="font-weight:700;text-align:center"></div>
+      <div id="qrBig"></div>
+      <div id="qrCode" style="display:grid;place-items:center"></div>
+      <p class="sub" id="qrCaption"></p>
+      <textarea id="qrFallback" readonly></textarea>
+      <button id="qrLink" class="big-btn ghost">Copy link instead</button>
+      <button id="qrClose" class="big-btn ghost">Hide</button>
     </div>
   </div>
 

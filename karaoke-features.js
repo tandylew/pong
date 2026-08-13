@@ -12,9 +12,14 @@
  *   backup → karaoke-backup.js  download/restore a .json backup file
  *   pwa    → karaoke-pwa.js     installable app + offline cache (karaoke-sw.js)
  *   qr     → karaoke-qr.js      share this page as a QR code
+ *   multiplayer → karaoke-multiplayer.js  same-room WebRTC play (needs qr.js)
  *   stats  → karaoke-stats.js   visit counter
  *
  * Dock API for features:  kdock.add({id, emoji, label, title, render(el)})
+ *
+ * Startup order: these modules are fetched and injected asynchronously, so a
+ * page's own script runs first. `await window.kready` (or listen for the
+ * "karaoke-ready" event) before touching window.kmp / kqr / kstore.user.
  */
 (function () {
   "use strict";
@@ -163,7 +168,9 @@
     if (!window.kveil.held()) window.kveil.release();  // auth script failed to load
     if (window.kfeatures.tools) await load("karaoke-tools.js");
     if (window.kfeatures.backup) await load("karaoke-backup.js");
-    if (window.kfeatures.qr) await load("karaoke-qr.js");
+    // the encoder is a dependency of multiplayer, not just of the share button
+    if (window.kfeatures.qr || window.kfeatures.multiplayer) await load("karaoke-qr.js");
+    if (window.kfeatures.multiplayer) await load("karaoke-multiplayer.js");
     if (window.kfeatures.stats) await load("karaoke-stats.js");
     if (window.kfeatures.pwa) await load("karaoke-pwa.js");
     else if ("serviceWorker" in navigator) {
@@ -176,7 +183,23 @@
       }).catch(function () {});
     }
   }
+  /* Features load asynchronously — read the JSON, then inject each module — so a
+   * page's own script runs BEFORE window.kmp or window.kqr exist. Anything that
+   * wants them at startup (a game auto-joining from a scanned invitation, say)
+   * has to wait, and polling for a global is a poor way to ask. */
+  var ready;
+  window.kready = new Promise(function (resolve) { ready = resolve; });
+  function start() {
+    boot().then(function () {
+      window.dispatchEvent(new Event("karaoke-ready"));
+      ready(window.kfeatures);
+    }, function (e) {
+      console.warn("karaoke-features:", e);
+      window.dispatchEvent(new Event("karaoke-ready"));
+      ready(window.kfeatures || {});
+    });
+  }
   if (document.readyState === "loading")
-    document.addEventListener("DOMContentLoaded", boot);
-  else boot();
+    document.addEventListener("DOMContentLoaded", start);
+  else start();
 })();
