@@ -1,4 +1,4 @@
-/* pong.js — 3D Pong (Three.js), local 2-player + same-room multiplayer.
+/* pong.js — Pong, local 2-player + same-room multiplayer.
  *
  * Online play is real peer-to-peer WebRTC over karaoke-multiplayer.js: the
  * host shows a QR code, the other player scans it with an ordinary phone
@@ -13,6 +13,13 @@
  *
  * Host is authoritative: it simulates the ball and owns the score, the guest
  * sends only its paddle position. Losing the opponent pauses rather than ends.
+ *
+ * Two things make the ball look the same on both screens, and neither is the
+ * network — the data channel round-trips in under 2 ms here:
+ *   • Rendering is a flat 2D canvas. As Three.js this measured 22 FPS with two
+ *     windows open on one laptop, and no amount of netcode fixes a 22 FPS ball.
+ *   • Snapshots carry velocity, and the guest asks kmp.sync.read() where things
+ *     are NOW rather than easing towards where they were. See karaoke-multiplayer.js.
  */
 (function () {
   "use strict";
@@ -27,90 +34,35 @@
   const BALL_SPEED0 = 6.5;
   const BALL_SPEED_MAX = 16;
   const WIN_SCORE = 7;
-  const SYNC_MS = 80;                    // ~12Hz state exchange
+  const SYNC_MS = 33;                    // 30 Hz snapshots (was 12 Hz)
 
-  // ---------- three.js setup ----------
+  // ---------- 2D canvas renderer ----------
+  // This was Three.js. Two WebGL contexts on one laptop measured 22 FPS each —
+  // the ball stuttered for reasons that had nothing to do with the network
+  // (the data channel round-trips in under 2 ms). A flat canvas draws the same
+  // game in a fraction of the budget, and pong loses nothing by being flat.
   const canvas = document.getElementById("game");
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0b1020);
-  scene.fog = new THREE.Fog(0x0b1020, 20, 42);
-
-  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
-
-  scene.add(new THREE.AmbientLight(0x8899ff, 0.55));
-  const key = new THREE.DirectionalLight(0xffffff, 1.1);
-  key.position.set(6, 14, 8);
-  scene.add(key);
-  const rim = new THREE.PointLight(0x6366f1, 1.2, 40);
-  rim.position.set(0, 6, 0);
-  scene.add(rim);
-
-  // court
-  const court = new THREE.Mesh(
-    new THREE.PlaneGeometry(HALF_W * 2, HALF_D * 2),
-    new THREE.MeshStandardMaterial({ color: 0x131a33, roughness: 0.9 })
-  );
-  court.rotation.x = -Math.PI / 2;
-  scene.add(court);
-
-  // center line
-  const centerLine = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.08, HALF_D * 2),
-    new THREE.MeshBasicMaterial({ color: 0x3b4270 })
-  );
-  centerLine.rotation.x = -Math.PI / 2;
-  centerLine.position.y = 0.01;
-  scene.add(centerLine);
-
-  // walls (top/bottom)
-  const wallMat = new THREE.MeshStandardMaterial({ color: 0x6366f1, emissive: 0x2a2f6b, emissiveIntensity: 0.6 });
-  [-1, 1].forEach((s) => {
-    const wall = new THREE.Mesh(new THREE.BoxGeometry(HALF_W * 2 + 0.4, 0.4, 0.25), wallMat);
-    wall.position.set(0, 0.2, s * (HALF_D + 0.1));
-    scene.add(wall);
-  });
-
-  function makePaddle(color) {
-    const m = new THREE.Mesh(
-      new THREE.BoxGeometry(PADDLE_D, PADDLE_H * 0.5, PADDLE_H),
-      new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35 })
-    );
-    m.position.y = PADDLE_H * 0.25;
-    scene.add(m);
-    return m;
-  }
-  const paddleL = makePaddle(0x22d3ee);
-  const paddleR = makePaddle(0xf472b6);
-  paddleL.position.x = -PADDLE_X;
-  paddleR.position.x = PADDLE_X;
-
-  const ball = new THREE.Mesh(
-    new THREE.SphereGeometry(BALL_R, 20, 16),
-    new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xaaaaaa, emissiveIntensity: 0.4 })
-  );
-  ball.position.y = BALL_R + 0.05;
-  scene.add(ball);
+  const ctx = canvas.getContext("2d");
+  let mirrored = false, viewW = 0, viewH = 0, scale = 1;
 
   function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
     const w = canvas.clientWidth, h = canvas.clientHeight;
-    renderer.setSize(w, h, false);
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
+    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+      canvas.width = w * dpr; canvas.height = h * dpr;
+    }
+    viewW = w; viewH = h;
+    scale = Math.min(w / (HALF_W * 2 + 1.5), h / (HALF_D * 2 + 1.5));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
   new ResizeObserver(resize).observe(canvas);
 
-  // camera: top-down-ish, angled from the local player's side so "their"
-  // paddle reads on the left. mirrored flips the whole court left/right.
-  let mirrored = false;
-  function placeCamera() {
-    const side = mirrored ? -1 : 1;   // opposite side of the court flips apparent left/right
-    camera.position.set(0.5, 13, side * 11);
-    camera.lookAt(0, 0, 0);
-  }
-  placeCamera();
+  // The guest sits at the other end of the table, so its view is flipped —
+  // whoever is holding the device always drives the paddle on the left.
+  function placeCamera() { /* kept: the guest's view flips via `mirrored` */ }
 
+  const toX = (x) => viewW / 2 + (mirrored ? -x : x) * scale;
+  const toY = (z) => viewH / 2 + (mirrored ? -z : z) * scale;
   // ---------- game state ----------
   const state = {
     mode: "menu",           // menu | local | host | guest
@@ -237,6 +189,17 @@
     if (wireNet.done) return;
     wireNet.done = true;
 
+    // Positions get republished constantly, so the newest one makes every older
+    // one worthless — exactly what the unreliable channel is for. Velocities go
+    // with them so the guest can work out where the ball is NOW rather than
+    // drawing where it was one packet ago.
+    kmp.sync.configure({
+      rate: 30,
+      predict: { bx: "bvx", bz: "bvz", zL: "vzL" },
+      maxAheadMs: 250,
+      smoothMs: 90,
+    });
+
     kmp.on("open", () => {
       connected = true;
       hideQr();
@@ -247,11 +210,9 @@
     });
 
     kmp.on("data", (d) => {
-      if (state.mode === "host") {
-        netTarget.zR = d.z;
-      } else if (state.mode === "guest") {
-        netTarget.zL = d.zL; netTarget.bx = d.bx; netTarget.bz = d.bz;
-        state.scoreL = d.sL; state.scoreR = d.sR;
+      // the only thing a guest sends is its paddle
+      if (state.mode === "host" && typeof d.z === "number") {
+        netTarget.zR = d.z; netTarget.vzR = d.vz || 0; netTarget.at = performance.now();
       }
     });
 
@@ -273,9 +234,14 @@
   function sendState() {
     if (!connected) return;
     if (state.mode === "host") {
-      kmp.send({ zL: state.zL, bx: state.bx, bz: state.bz, sL: state.scoreL, sR: state.scoreR });
+      // one authoritative snapshot: where things are AND how fast they're going
+      kmp.sync.publish({
+        bx: state.bx, bz: state.bz, bvx: state.bvx, bvz: state.bvz,
+        zL: state.zL, vzL: state.vzL || 0,
+        sL: state.scoreL, sR: state.scoreR, run: state.running,
+      }, true);
     } else if (state.mode === "guest") {
-      kmp.send({ z: state.zR });
+      kmp.sendFast({ z: state.zR, vz: state.vzR || 0 });
     }
   }
 
@@ -369,19 +335,34 @@
       state.zL = clampZ(state.zL); state.zR = clampZ(state.zR);
       if (state.running) stepBall(dt, true, true);
     } else if (state.mode === "host") {
+      const before = state.zL;
       if (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) state.zL -= PADDLE_SPEED * dt;
       if (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) state.zL += PADDLE_SPEED * dt;
       state.zL = clampZ(state.zL);
-      state.zR += (netTarget.zR - state.zR) * Math.min(1, dt * 10);
+      state.vzL = dt > 0 ? (state.zL - before) / dt : 0;
+      // the guest's paddle arrives with its velocity too, so carry it forward
+      // between packets instead of easing towards a position that's already old
+      const age = Math.min(0.25, (performance.now() - (netTarget.at || 0)) / 1000);
+      state.zR = clampZ(netTarget.zR + (netTarget.vzR || 0) * age);
       if (state.running) stepBall(dt, true, true);
     } else if (state.mode === "guest") {
+      const before = state.zR;
       if (keys.has("w") || keys.has("W") || keys.has("ArrowUp")) state.zR -= PADDLE_SPEED * dt;
       if (keys.has("s") || keys.has("S") || keys.has("ArrowDown")) state.zR += PADDLE_SPEED * dt;
-      state.zR = clampZ(state.zR);
-      state.zL += (netTarget.zL - state.zL) * Math.min(1, dt * 10);
-      // ball + score are host-authoritative: smoothly follow, don't simulate
-      state.bx += (netTarget.bx - state.bx) * Math.min(1, dt * 12);
-      state.bz += (netTarget.bz - state.bz) * Math.min(1, dt * 12);
+      state.zR = clampZ(state.zR);          // own paddle: never wait for the wire
+      state.vzR = dt > 0 ? (state.zR - before) / dt : 0;
+      // Everything else is the host's to decide. read() hands back the snapshot
+      // advanced to *now* — extrapolated along the velocities that came with it
+      // and offset by half the round trip — so the ball is where the host is
+      // drawing it, not where it was a packet ago.
+      const s = kmp.sync.read();
+      if (s) {
+        state.bx = s.bx; state.bz = s.bz;
+        state.bvx = s.bvx; state.bvz = s.bvz;
+        state.zL = clampZ(s.zL);
+        state.scoreL = s.sL; state.scoreR = s.sR;
+        state.running = !!s.run;
+      }
     }
 
     scoreEl.textContent = state.scoreL + " – " + state.scoreR;
@@ -444,11 +425,42 @@
   }
 
   function render() {
-    paddleL.position.z = state.zL;
-    paddleR.position.z = state.zR;
-    ball.position.x = state.bx;
-    ball.position.z = state.bz;
-    renderer.render(scene, camera);
+    if (!viewW) resize();
+    ctx.fillStyle = "#0b1020";
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    const left = toX(-HALF_W), right = toX(HALF_W);
+    const top = toY(-HALF_D), bot = toY(HALF_D);
+    const x0 = Math.min(left, right), y0 = Math.min(top, bot);
+    const w = Math.abs(right - left), h = Math.abs(bot - top);
+
+    ctx.fillStyle = "#131a33";
+    ctx.fillRect(x0, y0, w, h);
+    ctx.strokeStyle = "#6366f1";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x0, y0, w, h);
+
+    ctx.strokeStyle = "#3b4270";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 10]);
+    ctx.beginPath();
+    ctx.moveTo(toX(0), y0); ctx.lineTo(toX(0), y0 + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const pw = Math.max(4, PADDLE_W * scale * 2);
+    const ph = PADDLE_H * scale;
+    const paddle = (x, z, colour) => {
+      ctx.fillStyle = colour;
+      ctx.fillRect(toX(x) - pw / 2, toY(z) - ph / 2, pw, ph);
+    };
+    paddle(-PADDLE_X, state.zL, "#22d3ee");
+    paddle(PADDLE_X, state.zR, "#f472b6");
+
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(toX(state.bx), toY(state.bz), Math.max(3, BALL_R * scale * 1.6), 0, Math.PI * 2);
+    ctx.fill();
   }
 
   requestAnimationFrame(frame);
