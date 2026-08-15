@@ -506,9 +506,7 @@
     var id = pendingHost.id;
     pendingHost = null;
     if (stopWatching) { stopWatching(); stopWatching = null; }
-    // whichever route delivered the answer, the other one can stop looking
-    stopRoomWatch();
-    if (myRoom) { forgetRoom(myRoom); myRoom = null; }
+    stopRoomWatch();      // roomAfterJoin decides whether to re-arm or close
     return id;
   }
 
@@ -558,7 +556,7 @@
     if (!r.ok) throw new Error(r.status === 401
       ? "sign in first — rooms live in this site's data store" : "room lookup failed");
     var rec = await r.json();
-    if (!rec || !rec.offer) return null;
+    if (!rec || (!rec.offer && !rec.full)) return null;
     if (Date.now() - (rec.created || 0) > ROOM_TTL_MS) return null;   // stale
     return rec;
   }
@@ -576,33 +574,64 @@
                 { method: "DELETE", credentials: "same-origin" }); } catch (e) {}
   }
 
+  /** Put a fresh offer in the room under the code it already has.
+   *
+   *  A WebRTC offer answers exactly one peer, so a room that holds a single
+   *  offer is a room exactly two people can ever use. Re-arming after each join
+   *  is what lets one code seat a whole table — without it a four-player game
+   *  built on this could never fill up. */
+  async function armRoom(code) {
+    var inv = await host();
+    await writeRoom(code, { offer: inv.code, answer: null, created: Date.now() });
+    return inv;
+  }
+
+  function watchRoom(code) {
+    stopRoomWatch();
+    var until = Date.now() + ROOM_TTL_MS;
+    roomTimer = setInterval(async function () {
+      if (Date.now() > until || myRoom !== code) return stopRoomWatch();
+      try {
+        var rec = await readRoom(code);
+        if (rec && rec.answer) {
+          stopRoomWatch();
+          await accept(rec.answer);       // "open" fires next; roomAfterJoin re-arms
+        }
+      } catch (e) { /* a blip shouldn't end the wait */ }
+    }, ROOM_POLL_MS);
+  }
+
+  /** Once a player is in: re-open the room for the next one, or close it. */
+  async function roomAfterJoin() {
+    if (!myRoom) return;
+    var code = myRoom;
+    if (api.peers.length >= api.maxPeers) {
+      // leave a marker rather than deleting, so a latecomer is told the game is
+      // full instead of "no such room", which reads like they typed it wrong
+      try { await writeRoom(code, { full: true, created: Date.now() }); } catch (e) {}
+      stopRoomWatch();
+      myRoom = null;
+      emit("full", code);
+      return;
+    }
+    try {
+      await armRoom(code);
+      watchRoom(code);
+    } catch (e) { emit("error", e); }
+  }
+
   async function createRoom() {
     if (!(await apiAvailable()))
       throw new Error("this site has no server, so it can't hold room codes — share the link or QR instead");
-    var inv = await host();
     var code = "";
     for (var tries = 0; tries < 5 && !code; tries++) {
       var candidate = newCode(4);
       if (!(await readRoom(candidate))) code = candidate;      // free, or expired
     }
     if (!code) throw new Error("couldn't find a free room code — try again");
-    await writeRoom(code, { offer: inv.code, answer: null, created: Date.now() });
     myRoom = code;
-
-    if (roomTimer) clearInterval(roomTimer);
-    var until = Date.now() + ROOM_TTL_MS;
-    roomTimer = setInterval(async function () {
-      if (Date.now() > until) return stopRoomWatch();
-      try {
-        var rec = await readRoom(code);
-        if (rec && rec.answer) {
-          stopRoomWatch();
-          await accept(rec.answer);
-          forgetRoom(code);
-        }
-      } catch (e) { /* a blip shouldn't end the wait */ }
-    }, ROOM_POLL_MS);
-
+    var inv = await armRoom(code);
+    watchRoom(code);
     return { room: code, code: inv.code, url: inv.url, id: inv.id,
              localOnly: inv.localOnly };
   }
@@ -617,6 +646,7 @@
     if (!(await apiAvailable()))
       throw new Error("this site has no server, so room codes don't work here — paste the invite link instead");
     var rec = await readRoom(code);
+    if (rec && rec.full) throw new Error('room "' + code + '" is full');
     if (!rec) throw new Error('no room "' + code + '" — check the code, or ask for a new one');
     var ans = await join(rec.offer);
     await writeRoom(code, { offer: rec.offer, answer: ans.code, created: rec.created });
@@ -717,6 +747,11 @@
   api = {
     isHost: false,
     state: null,
+    /** How many players this game seats, besides the host. A room code stays
+     *  live until that many have joined, then reports itself full. Games with a
+     *  fixed shape (pong is two paddles) must set this, or a third player
+     *  silently ends up driving somebody else's piece. */
+    maxPeers: Infinity,
     /** Peers you can actually talk to. A peer record exists from the moment its
      *  connection is created, which is well before the channel opens — reporting
      *  those as connected invites everyone to send into a socket that isn't
@@ -788,6 +823,10 @@
     _pack: pack, _unpack: unpack, _buildSdp: buildSdp, _readSdp: readSdp,
   };
   window.kmp = api;
+
+  // Once a player is in, the room either re-opens for the next one or closes.
+  // Driven off "open" so it covers every route in — typed code, QR, or paste.
+  api.on("open", function () { roomAfterJoin(); });
 
   // ── dock UI ────────────────────────────────────────────────────────────────
   if (!window.kdock) return;

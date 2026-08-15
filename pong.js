@@ -198,6 +198,10 @@
     // one worthless — exactly what the unreliable channel is for. Velocities go
     // with them so the guest can work out where the ball is NOW rather than
     // drawing where it was one packet ago.
+    // Two paddles, so exactly one opponent. Without this the room would stay
+    // open and a third player would end up driving the same paddle as the second.
+    kmp.maxPeers = 1;
+
     kmp.sync.configure({
       rate: 30,
       predict: { bx: "bvx", bz: "bvz", zL: "vzL" },
