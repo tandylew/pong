@@ -330,7 +330,19 @@
    *   kmp.sync.publish({ bx, by, bvx, bvy, score });   // host
    *   const s = kmp.sync.read();                       // anyone, every frame
    */
-  var syncCfg = { rate: 30, predict: {}, maxAheadMs: 300, smoothMs: 120 };
+  var syncCfg = {
+    rate: 30,
+    predict: {},          // { positionKey: velocityKey } for linear prediction
+    advance: null,        // optional (state, dtSeconds) => void — real physics
+    maxAheadMs: 200,
+    smoothMs: 90,
+    /** Above this much error, TELEPORT instead of easing. Easing assumes the
+     *  prediction drifted; when the host resets a ball to the centre, or a piece
+     *  jumps, nothing drifted — and easing sends the object gliding across the
+     *  board. Getting this wrong is the single most visible netcode bug there
+     *  is, so the default is deliberately small. */
+    snapAbove: 1.5,
+  };
   var snap = null;            // newest snapshot + when it landed
   var corr = {};              // per-key correction still being eased away
   var lastPublish = 0;
@@ -340,15 +352,23 @@
     : function () { return Date.now(); };
 
   function takeSnapshot(msg, rec) {
-    var prev = snap && snap.s;
     var incoming = msg.s || {};
-    if (prev) {
-      // Where did we *say* the object was a moment ago? Whatever the difference
-      // is, carry it as a correction and bleed it off over smoothMs.
+    if (snap) {
+      // Where did we *say* things were a moment ago? The difference is either a
+      // small mis-prediction to be smoothed away, or a genuine jump to be
+      // obeyed at once. Telling those two apart is the whole job.
       var predicted = predictInto({}, snap, 0);
+      var jumped = false, errs = {};
       for (var k in syncCfg.predict) {
-        if (typeof predicted[k] === "number" && typeof incoming[k] === "number")
-          corr[k] = (corr[k] || 0) + (predicted[k] - incoming[k]);
+        if (typeof predicted[k] !== "number" || typeof incoming[k] !== "number") continue;
+        errs[k] = predicted[k] - incoming[k];
+        if (Math.abs(errs[k]) > syncCfg.snapAbove) jumped = true;
+      }
+      if (jumped) {
+        corr = {};            // a teleport: show it where it now is, immediately
+        emit("jump", incoming, rec ? rec.id : null);
+      } else {
+        for (var e in errs) corr[e] = (corr[e] || 0) + errs[e];
       }
     }
     snap = { s: incoming, at: now(), t: msg.c };
@@ -359,6 +379,14 @@
   function predictInto(out, from, extraMs) {
     var s = from.s, ageMs = Math.min(syncCfg.maxAheadMs, now() - from.at + extraMs);
     for (var k in s) out[k] = s[k];
+    if (typeof syncCfg.advance === "function") {
+      // The game's own integrator. Straight-line prediction walks a ball
+      // through the wall it was about to bounce off; real physics doesn't.
+      try {
+        syncCfg.advance(out, ageMs / 1000);
+        return out;
+      } catch (err) { /* fall back to the linear form below */ }
+    }
     for (var key in syncCfg.predict) {
       var vk = syncCfg.predict[key];
       if (typeof s[key] === "number" && typeof s[vk] === "number")

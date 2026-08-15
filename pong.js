@@ -86,6 +86,11 @@
     resetBall(state.serve);
   }
 
+  // A debug window onto the live state. Multiplayer bugs are invisible from
+  // outside — you cannot tell a stutter from a mis-prediction by looking — so
+  // the test harness reads both players' idea of the ball from here.
+  window.__pong = state;
+
   // ---------- input ----------
   const keys = new Set();
   addEventListener("keydown", (e) => keys.add(e.key));
@@ -196,8 +201,32 @@
     kmp.sync.configure({
       rate: 30,
       predict: { bx: "bvx", bz: "bvz", zL: "vzL" },
-      maxAheadMs: 250,
+      maxAheadMs: 200,
       smoothMs: 90,
+      // A point resets the ball to the middle. That is a jump, not a
+      // mis-prediction, and easing it sends the ball gliding the length of the
+      // court — which is exactly what "the ball is glitching" looked like.
+      // Anything further than this and the guest simply obeys the host.
+      snapAbove: 1.2,
+      // Predict with the real rules rather than a straight line, so the ball
+      // bounces off the walls between snapshots instead of walking through them.
+      advance: (s, dt) => {
+        s.bx += s.bvx * dt;
+        s.bz += s.bvz * dt;
+        if (Math.abs(s.bz) > WALL_Z) {
+          s.bz = Math.sign(s.bz) * WALL_Z;
+          s.bvz *= -1;
+        }
+        // Past the end line a point has been scored and the host is about to
+        // reset. Hold the ball at the edge rather than predicting it off into
+        // space for the ~33 ms until that snapshot lands.
+        if (Math.abs(s.bx) > HALF_W) {
+          s.bx = Math.sign(s.bx) * HALF_W;
+          s.bvx = 0; s.bvz = 0;
+        }
+        if (typeof s.zL === "number" && typeof s.vzL === "number")
+          s.zL = clampZ(s.zL + s.vzL * dt);
+      },
     });
 
     kmp.on("open", () => {
@@ -409,6 +438,10 @@
   function score(who) {
     if (who === "L") state.scoreL++; else state.scoreR++;
     resetBall(who === "L" ? 1 : -1);
+    // Don't make the guest wait up to a whole tick to learn the ball moved: a
+    // discrete event is worth a packet of its own, and it's the one moment the
+    // two screens would otherwise visibly disagree.
+    if (state.mode === "host" && connected) sendState();
   }
 
   function checkWin() {
