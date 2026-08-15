@@ -42,7 +42,8 @@
   var MAX_CANDIDATES = 6;               // keeps the QR scannable
   var PING_MS = 3000, DEAD_MS = 12000;
   var CHANNEL = "kmp";
-  var DROPBOX = "kmp:answer";           // localStorage hand-off, see scanBack()
+  var DROPBOX = "kmp:answer";           // localStorage hand-off, see watchForAnswer()
+  var HOST_BEAT = "kmp:hosting";        // "a game tab here is waiting for one"
 
   var listeners = {}, peers = {}, nextId = 1;
   var api = null, pendingHost = null, stopWatching = null;
@@ -529,15 +530,44 @@
   var ROOM_TTL_MS = 15 * 60 * 1000;
   var ROOM_POLL_MS = 1500;
   var ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no O/0/I/1
-  var apiState = null, roomTimer = null, myRoom = null;
+  var apiState = null, roomTimer = null, myRoom = null, roomOrigin = null;
+
+  /** Where room notes live. Normally this site's own /api/data — but a statically
+   *  hosted copy has no server at all, so it can borrow one: point this at a
+   *  deployment of the same game (Cloud Run or the VM) and typed room codes work
+   *  on GitHub Pages too. That server is a MAILBOX, nothing more; play still goes
+   *  browser-to-browser, and only `rooms/` is cross-origin readable.
+   *
+   *  `deploy_pages.py` wires this automatically when the project is also
+   *  deployed somewhere with a server, via karaoke-rooms.json. */
+  function roomBase() {
+    return (roomOrigin ? roomOrigin.replace(/\/+$/, "") + "/" : "") + "api/data/";
+  }
+
+  async function loadRoomConfig() {
+    if (roomOrigin !== null) return roomOrigin;
+    roomOrigin = "";
+    try {
+      var r = await fetch("karaoke-rooms.json", { cache: "no-store" });
+      if (r.ok) {
+        var j = await r.json();
+        if (j && j.origin) roomOrigin = String(j.origin);
+      }
+    } catch (e) { /* no config — this site's own API, or none at all */ }
+    return roomOrigin;
+  }
 
   async function apiAvailable() {
     if (apiState !== null) return apiState;
+    await loadRoomConfig();
     try {
-      var r = await fetch("api/data", { cache: "no-store", credentials: "same-origin" });
-      // 401 still means a server is answering — it just wants a sign-in first,
-      // and the session cookie rides along on these same requests
-      apiState = r.ok || r.status === 401 || r.status === 403;
+      var url = roomOrigin ? roomBase() + "rooms/probe" : "api/data";
+      var r = await fetch(url, { cache: "no-store",
+                                 credentials: roomOrigin ? "omit" : "same-origin" });
+      // 401/403 still means a server is answering — it just wants a sign-in
+      // first; 404 on the probe key means the store is there and simply empty
+      apiState = r.ok || r.status === 401 || r.status === 403 ||
+                 (!!roomOrigin && r.status === 404);
     } catch (e) { apiState = false; }
     return apiState;
   }
@@ -550,8 +580,8 @@
   }
 
   async function readRoom(code) {
-    var r = await fetch("api/data/" + ROOM_KEY + code,
-                        { cache: "no-store", credentials: "same-origin" });
+    var r = await fetch(roomBase() + ROOM_KEY + code,
+                        { cache: "no-store", credentials: roomOrigin ? "omit" : "same-origin" });
     if (r.status === 404) return null;
     if (!r.ok) throw new Error(r.status === 401
       ? "sign in first — rooms live in this site's data store" : "room lookup failed");
@@ -562,16 +592,17 @@
   }
 
   async function writeRoom(code, rec) {
-    var r = await fetch("api/data/" + ROOM_KEY + code, {
-      method: "PUT", credentials: "same-origin", body: JSON.stringify(rec) });
+    var r = await fetch(roomBase() + ROOM_KEY + code, {
+      method: "PUT", credentials: roomOrigin ? "omit" : "same-origin",
+      body: JSON.stringify(rec) });
     if (!r.ok) throw new Error(r.status === 401
       ? "sign in first — rooms live in this site's data store" : "could not save the room");
   }
 
   function forgetRoom(code) {
     // the note has been read; leaving it lying around only invites confusion
-    try { fetch("api/data/" + ROOM_KEY + code,
-                { method: "DELETE", credentials: "same-origin" }); } catch (e) {}
+    try { fetch(roomBase() + ROOM_KEY + code,
+                { method: "DELETE", credentials: roomOrigin ? "omit" : "same-origin" }); } catch (e) {}
   }
 
   /** Put a fresh offer in the room under the code it already has.
@@ -671,6 +702,15 @@
       seen = code;
       onAnswer(code);
     };
+    // Announce that a game tab is sitting here waiting. The relay tab checks
+    // this before claiming success: if the hosting tab was closed — or the
+    // player pasted the answer into it and navigated it away, which destroys the
+    // connection — there is nobody to hand the answer to, and saying "sent back
+    // to the game" would be a lie.
+    var beat = setInterval(function () {
+      try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
+    }, 500);
+    try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
     var bc = null;
     try {
       bc = new BroadcastChannel(CHANNEL);
@@ -691,8 +731,18 @@
     });
     return function stop() {
       clearInterval(poll);
+      clearInterval(beat);
+      try { localStorage.removeItem(HOST_BEAT); } catch (e) {}
       if (bc) try { bc.close(); } catch (e) {}
     };
+  }
+
+  /** Is a game tab on this device actually waiting for an answer right now? */
+  function hostIsWaiting() {
+    try {
+      var t = parseInt(localStorage.getItem(HOST_BEAT) || "0", 10);
+      return Date.now() - t < 3000;
+    } catch (e) { return false; }
   }
 
   /** Running in the tab the host's camera opened: hand the answer to the game
@@ -1081,11 +1131,23 @@
   // Not on the "load" event: this file is injected by the feature loader, which
   // usually finishes after load has already fired — so that listener never runs.
   if (answerInUrl) {
+    var delivered = hostIsWaiting();
     var banner = function () {
       var note = document.createElement("div");
       note.style.cssText = "position:fixed;inset:auto 0 0 0;z-index:99960;padding:1rem;" +
-        "background:#065f46;color:#fff;font:600 15px system-ui;text-align:center";
-      note.textContent = "✓ Answer sent back to the game — you can close this tab.";
+        "font:600 15px/1.5 system-ui;text-align:center;color:#fff;background:" +
+        (delivered ? "#065f46" : "#7c2d12");
+      if (delivered) {
+        note.textContent = "✓ Answer sent back to the game — you can close this tab.";
+      } else {
+        // Almost always: they pasted the answer into the tab that was hosting,
+        // which navigated it away and took the connection with it.
+        note.innerHTML = "⚠ No game is waiting on this device.<br>" +
+          "<span style='font-weight:400;font-size:14px'>The tab that created the " +
+          "room was closed, or this link was opened in it. Create a room again and " +
+          "use <b>“Paste their answer”</b> on that screen instead of opening the " +
+          "link.</span>";
+      }
       document.body.appendChild(note);
     };
     if (document.body) banner();

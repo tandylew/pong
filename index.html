@@ -58,6 +58,9 @@
   #qrFallback { display:none; width:100%; height:70px; font:.7rem ui-monospace,monospace;
                 background:#0e1430; color:var(--ink); border:1px solid var(--line);
                 border-radius:8px; padding:.4rem; }
+  #qrAnswer { display:none; }
+  #qrAnswer .row input { text-transform:none; letter-spacing:0; text-align:left;
+                         font-size:.8rem; }
 </style>
 </head>
 <body>
@@ -106,6 +109,16 @@
       <p class="sub" id="qrCaption"></p>
       <textarea id="qrFallback" readonly></textarea>
       <button id="qrLink" class="big-btn ghost">Copy link instead</button>
+      <!-- The desktop route. Opening their answer link in this window would
+           navigate the game away and kill the connection, so the answer gets
+           pasted in here instead. -->
+      <div id="qrAnswer">
+        <div class="divider">or paste their answer</div>
+        <div class="row">
+          <input id="ansIn" placeholder="paste the answer link they send you">
+          <button id="ansGo" class="big-btn">Connect</button>
+        </div>
+      </div>
       <button id="qrClose" class="big-btn ghost">Hide</button>
     </div>
   </div>

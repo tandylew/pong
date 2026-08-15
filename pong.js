@@ -159,6 +159,23 @@
   $("btnMenu").addEventListener("click", () => showMenu());
   $("qrClose").addEventListener("click", () => hideQr());
 
+  // The desktop handshake: they send you their answer link, you paste it here.
+  // Navigating this window to that link instead would destroy the very
+  // connection it is trying to complete.
+  $("ansGo").addEventListener("click", async () => {
+    const raw = ($("ansIn").value || "").trim();
+    if (!raw) { $("msg").textContent = "Paste their answer link first."; return; }
+    try {
+      const m = /[#&]kmpa?=([A-Za-z0-9\-_]+)/.exec(raw);
+      await kmp.accept(m ? m[1] : raw);
+      netEl.textContent = "Answer accepted — connecting…";
+      $("ansIn").value = "";
+    } catch (e) {
+      $("msg").textContent = e.message || String(e);
+    }
+  });
+  $("ansIn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ansGo").click(); });
+
   // ---------- networking (WebRTC data channel via karaoke-multiplayer.js) ----
   let netTimer = null, connected = false;
 
@@ -169,11 +186,13 @@
   }
   addEventListener("beforeunload", stopNet);
 
-  function qrPanel(url, heading, caption, bigCode) {
+  function qrPanel(url, heading, caption, bigCode, wantAnswer) {
     const svg = window.kqr ? kqr.svg(url, 230) : null;
     $("qrTitle").textContent = heading;
     $("qrBig").textContent = bigCode || "";
     $("qrBig").style.display = bigCode ? "block" : "none";
+    // Only the host is waiting for an answer; the guest has already sent one.
+    $("qrAnswer").style.display = wantAnswer ? "block" : "none";
     $("qrCaption").textContent = caption;
     $("qrCode").innerHTML = svg ||
       "<p class='sub'>Couldn't draw the code — use the link button below.</p>";
@@ -304,14 +323,14 @@
         netEl.textContent = "Room " + r.room + " — waiting for an opponent";
         qrPanel(r.url, "Room " + r.room,
           "They open this site on any device and type " + r.room +
-          " — or point a phone camera at the code to skip the typing.", r.room);
+          " — or point a phone camera at the code to skip the typing.", r.room, true);
       } else {
         const inv = await kmp.host();
         netEl.textContent = "Waiting for an opponent…";
         qrPanel(inv.url, "Scan or share to join",
           inv.localOnly
             ? "This page is on localhost, so the link only opens on this machine — deploy it or use the network address."
-            : "Point their phone camera at this, or send them the link. On a computer, paste the link into Join.");
+            : "Point their phone camera at this, or send them the link. When they send their answer back, paste it below.", null, true);
       }
     } catch (e) {
       showMenu(e.message || String(e));
