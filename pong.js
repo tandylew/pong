@@ -86,6 +86,11 @@
     resetBall(state.serve);
   }
 
+  // A debug window onto the live state. Multiplayer bugs are invisible from
+  // outside — you cannot tell a stutter from a mis-prediction by looking — so
+  // the test harness reads both players' idea of the ball from here.
+  window.__pong = state;
+
   // ---------- input ----------
   const keys = new Set();
   addEventListener("keydown", (e) => keys.add(e.key));
@@ -154,6 +159,23 @@
   $("btnMenu").addEventListener("click", () => showMenu());
   $("qrClose").addEventListener("click", () => hideQr());
 
+  // The desktop handshake: they send you their answer link, you paste it here.
+  // Navigating this window to that link instead would destroy the very
+  // connection it is trying to complete.
+  $("ansGo").addEventListener("click", async () => {
+    const raw = ($("ansIn").value || "").trim();
+    if (!raw) { $("msg").textContent = "Paste their answer link first."; return; }
+    try {
+      const m = /[#&]kmpa?=([A-Za-z0-9\-_]+)/.exec(raw);
+      await kmp.accept(m ? m[1] : raw);
+      netEl.textContent = "Answer accepted — connecting…";
+      $("ansIn").value = "";
+    } catch (e) {
+      $("msg").textContent = e.message || String(e);
+    }
+  });
+  $("ansIn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ansGo").click(); });
+
   // ---------- networking (WebRTC data channel via karaoke-multiplayer.js) ----
   let netTimer = null, connected = false;
 
@@ -164,11 +186,13 @@
   }
   addEventListener("beforeunload", stopNet);
 
-  function qrPanel(url, heading, caption, bigCode) {
+  function qrPanel(url, heading, caption, bigCode, wantAnswer) {
     const svg = window.kqr ? kqr.svg(url, 230) : null;
     $("qrTitle").textContent = heading;
     $("qrBig").textContent = bigCode || "";
     $("qrBig").style.display = bigCode ? "block" : "none";
+    // Only the host is waiting for an answer; the guest has already sent one.
+    $("qrAnswer").style.display = wantAnswer ? "block" : "none";
     $("qrCaption").textContent = caption;
     $("qrCode").innerHTML = svg ||
       "<p class='sub'>Couldn't draw the code — use the link button below.</p>";
@@ -193,11 +217,39 @@
     // one worthless — exactly what the unreliable channel is for. Velocities go
     // with them so the guest can work out where the ball is NOW rather than
     // drawing where it was one packet ago.
+    // Two paddles, so exactly one opponent. Without this the room would stay
+    // open and a third player would end up driving the same paddle as the second.
+    kmp.maxPeers = 1;
+
     kmp.sync.configure({
       rate: 30,
       predict: { bx: "bvx", bz: "bvz", zL: "vzL" },
-      maxAheadMs: 250,
+      maxAheadMs: 200,
       smoothMs: 90,
+      // A point resets the ball to the middle. That is a jump, not a
+      // mis-prediction, and easing it sends the ball gliding the length of the
+      // court — which is exactly what "the ball is glitching" looked like.
+      // Anything further than this and the guest simply obeys the host.
+      snapAbove: 1.2,
+      // Predict with the real rules rather than a straight line, so the ball
+      // bounces off the walls between snapshots instead of walking through them.
+      advance: (s, dt) => {
+        s.bx += s.bvx * dt;
+        s.bz += s.bvz * dt;
+        if (Math.abs(s.bz) > WALL_Z) {
+          s.bz = Math.sign(s.bz) * WALL_Z;
+          s.bvz *= -1;
+        }
+        // Past the end line a point has been scored and the host is about to
+        // reset. Hold the ball at the edge rather than predicting it off into
+        // space for the ~33 ms until that snapshot lands.
+        if (Math.abs(s.bx) > HALF_W) {
+          s.bx = Math.sign(s.bx) * HALF_W;
+          s.bvx = 0; s.bvz = 0;
+        }
+        if (typeof s.zL === "number" && typeof s.vzL === "number")
+          s.zL = clampZ(s.zL + s.vzL * dt);
+      },
     });
 
     kmp.on("open", () => {
@@ -271,14 +323,14 @@
         netEl.textContent = "Room " + r.room + " — waiting for an opponent";
         qrPanel(r.url, "Room " + r.room,
           "They open this site on any device and type " + r.room +
-          " — or point a phone camera at the code to skip the typing.", r.room);
+          " — or point a phone camera at the code to skip the typing.", r.room, true);
       } else {
         const inv = await kmp.host();
         netEl.textContent = "Waiting for an opponent…";
         qrPanel(inv.url, "Scan or share to join",
           inv.localOnly
             ? "This page is on localhost, so the link only opens on this machine — deploy it or use the network address."
-            : "Point their phone camera at this, or send them the link. On a computer, paste the link into Join.");
+            : "Point their phone camera at this, or send them the link. When they send their answer back, paste it below.", null, true);
       }
     } catch (e) {
       showMenu(e.message || String(e));
@@ -404,11 +456,19 @@
     state.bvx = -fromSide * speed * Math.cos(ang);
     state.bvz = speed * Math.sin(ang);
     state.bx = fromSide === -1 ? -PADDLE_X + PADDLE_D / 2 + BALL_R : PADDLE_X - PADDLE_D / 2 - BALL_R;
+    // A bounce reverses the ball, and until the guest hears about it its
+    // prediction is confidently heading the wrong way. Discrete events are
+    // worth their own packet — the same reason score() sends one.
+    if (state.mode === "host" && connected) sendState();
   }
 
   function score(who) {
     if (who === "L") state.scoreL++; else state.scoreR++;
     resetBall(who === "L" ? 1 : -1);
+    // Don't make the guest wait up to a whole tick to learn the ball moved: a
+    // discrete event is worth a packet of its own, and it's the one moment the
+    // two screens would otherwise visibly disagree.
+    if (state.mode === "host" && connected) sendState();
   }
 
   function checkWin() {

@@ -42,7 +42,8 @@
   var MAX_CANDIDATES = 6;               // keeps the QR scannable
   var PING_MS = 3000, DEAD_MS = 12000;
   var CHANNEL = "kmp";
-  var DROPBOX = "kmp:answer";           // localStorage hand-off, see scanBack()
+  var DROPBOX = "kmp:answer";           // localStorage hand-off, see watchForAnswer()
+  var HOST_BEAT = "kmp:hosting";        // "a game tab here is waiting for one"
 
   var listeners = {}, peers = {}, nextId = 1;
   var api = null, pendingHost = null, stopWatching = null;
@@ -330,7 +331,19 @@
    *   kmp.sync.publish({ bx, by, bvx, bvy, score });   // host
    *   const s = kmp.sync.read();                       // anyone, every frame
    */
-  var syncCfg = { rate: 30, predict: {}, maxAheadMs: 300, smoothMs: 120 };
+  var syncCfg = {
+    rate: 30,
+    predict: {},          // { positionKey: velocityKey } for linear prediction
+    advance: null,        // optional (state, dtSeconds) => void — real physics
+    maxAheadMs: 200,
+    smoothMs: 90,
+    /** Above this much error, TELEPORT instead of easing. Easing assumes the
+     *  prediction drifted; when the host resets a ball to the centre, or a piece
+     *  jumps, nothing drifted — and easing sends the object gliding across the
+     *  board. Getting this wrong is the single most visible netcode bug there
+     *  is, so the default is deliberately small. */
+    snapAbove: 1.5,
+  };
   var snap = null;            // newest snapshot + when it landed
   var corr = {};              // per-key correction still being eased away
   var lastPublish = 0;
@@ -340,15 +353,23 @@
     : function () { return Date.now(); };
 
   function takeSnapshot(msg, rec) {
-    var prev = snap && snap.s;
     var incoming = msg.s || {};
-    if (prev) {
-      // Where did we *say* the object was a moment ago? Whatever the difference
-      // is, carry it as a correction and bleed it off over smoothMs.
+    if (snap) {
+      // Where did we *say* things were a moment ago? The difference is either a
+      // small mis-prediction to be smoothed away, or a genuine jump to be
+      // obeyed at once. Telling those two apart is the whole job.
       var predicted = predictInto({}, snap, 0);
+      var jumped = false, errs = {};
       for (var k in syncCfg.predict) {
-        if (typeof predicted[k] === "number" && typeof incoming[k] === "number")
-          corr[k] = (corr[k] || 0) + (predicted[k] - incoming[k]);
+        if (typeof predicted[k] !== "number" || typeof incoming[k] !== "number") continue;
+        errs[k] = predicted[k] - incoming[k];
+        if (Math.abs(errs[k]) > syncCfg.snapAbove) jumped = true;
+      }
+      if (jumped) {
+        corr = {};            // a teleport: show it where it now is, immediately
+        emit("jump", incoming, rec ? rec.id : null);
+      } else {
+        for (var e in errs) corr[e] = (corr[e] || 0) + errs[e];
       }
     }
     snap = { s: incoming, at: now(), t: msg.c };
@@ -359,6 +380,14 @@
   function predictInto(out, from, extraMs) {
     var s = from.s, ageMs = Math.min(syncCfg.maxAheadMs, now() - from.at + extraMs);
     for (var k in s) out[k] = s[k];
+    if (typeof syncCfg.advance === "function") {
+      // The game's own integrator. Straight-line prediction walks a ball
+      // through the wall it was about to bounce off; real physics doesn't.
+      try {
+        syncCfg.advance(out, ageMs / 1000);
+        return out;
+      } catch (err) { /* fall back to the linear form below */ }
+    }
     for (var key in syncCfg.predict) {
       var vk = syncCfg.predict[key];
       if (typeof s[key] === "number" && typeof s[vk] === "number")
@@ -478,9 +507,7 @@
     var id = pendingHost.id;
     pendingHost = null;
     if (stopWatching) { stopWatching(); stopWatching = null; }
-    // whichever route delivered the answer, the other one can stop looking
-    stopRoomWatch();
-    if (myRoom) { forgetRoom(myRoom); myRoom = null; }
+    stopRoomWatch();      // roomAfterJoin decides whether to re-arm or close
     return id;
   }
 
@@ -503,15 +530,44 @@
   var ROOM_TTL_MS = 15 * 60 * 1000;
   var ROOM_POLL_MS = 1500;
   var ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no O/0/I/1
-  var apiState = null, roomTimer = null, myRoom = null;
+  var apiState = null, roomTimer = null, myRoom = null, roomOrigin = null;
+
+  /** Where room notes live. Normally this site's own /api/data — but a statically
+   *  hosted copy has no server at all, so it can borrow one: point this at a
+   *  deployment of the same game (Cloud Run or the VM) and typed room codes work
+   *  on GitHub Pages too. That server is a MAILBOX, nothing more; play still goes
+   *  browser-to-browser, and only `rooms/` is cross-origin readable.
+   *
+   *  `deploy_pages.py` wires this automatically when the project is also
+   *  deployed somewhere with a server, via karaoke-rooms.json. */
+  function roomBase() {
+    return (roomOrigin ? roomOrigin.replace(/\/+$/, "") + "/" : "") + "api/data/";
+  }
+
+  async function loadRoomConfig() {
+    if (roomOrigin !== null) return roomOrigin;
+    roomOrigin = "";
+    try {
+      var r = await fetch("karaoke-rooms.json", { cache: "no-store" });
+      if (r.ok) {
+        var j = await r.json();
+        if (j && j.origin) roomOrigin = String(j.origin);
+      }
+    } catch (e) { /* no config — this site's own API, or none at all */ }
+    return roomOrigin;
+  }
 
   async function apiAvailable() {
     if (apiState !== null) return apiState;
+    await loadRoomConfig();
     try {
-      var r = await fetch("api/data", { cache: "no-store", credentials: "same-origin" });
-      // 401 still means a server is answering — it just wants a sign-in first,
-      // and the session cookie rides along on these same requests
-      apiState = r.ok || r.status === 401 || r.status === 403;
+      var url = roomOrigin ? roomBase() + "rooms/probe" : "api/data";
+      var r = await fetch(url, { cache: "no-store",
+                                 credentials: roomOrigin ? "omit" : "same-origin" });
+      // 401/403 still means a server is answering — it just wants a sign-in
+      // first; 404 on the probe key means the store is there and simply empty
+      apiState = r.ok || r.status === 401 || r.status === 403 ||
+                 (!!roomOrigin && r.status === 404);
     } catch (e) { apiState = false; }
     return apiState;
   }
@@ -524,57 +580,89 @@
   }
 
   async function readRoom(code) {
-    var r = await fetch("api/data/" + ROOM_KEY + code,
-                        { cache: "no-store", credentials: "same-origin" });
+    var r = await fetch(roomBase() + ROOM_KEY + code,
+                        { cache: "no-store", credentials: roomOrigin ? "omit" : "same-origin" });
     if (r.status === 404) return null;
     if (!r.ok) throw new Error(r.status === 401
       ? "sign in first — rooms live in this site's data store" : "room lookup failed");
     var rec = await r.json();
-    if (!rec || !rec.offer) return null;
+    if (!rec || (!rec.offer && !rec.full)) return null;
     if (Date.now() - (rec.created || 0) > ROOM_TTL_MS) return null;   // stale
     return rec;
   }
 
   async function writeRoom(code, rec) {
-    var r = await fetch("api/data/" + ROOM_KEY + code, {
-      method: "PUT", credentials: "same-origin", body: JSON.stringify(rec) });
+    var r = await fetch(roomBase() + ROOM_KEY + code, {
+      method: "PUT", credentials: roomOrigin ? "omit" : "same-origin",
+      body: JSON.stringify(rec) });
     if (!r.ok) throw new Error(r.status === 401
       ? "sign in first — rooms live in this site's data store" : "could not save the room");
   }
 
   function forgetRoom(code) {
     // the note has been read; leaving it lying around only invites confusion
-    try { fetch("api/data/" + ROOM_KEY + code,
-                { method: "DELETE", credentials: "same-origin" }); } catch (e) {}
+    try { fetch(roomBase() + ROOM_KEY + code,
+                { method: "DELETE", credentials: roomOrigin ? "omit" : "same-origin" }); } catch (e) {}
+  }
+
+  /** Put a fresh offer in the room under the code it already has.
+   *
+   *  A WebRTC offer answers exactly one peer, so a room that holds a single
+   *  offer is a room exactly two people can ever use. Re-arming after each join
+   *  is what lets one code seat a whole table — without it a four-player game
+   *  built on this could never fill up. */
+  async function armRoom(code) {
+    var inv = await host();
+    await writeRoom(code, { offer: inv.code, answer: null, created: Date.now() });
+    return inv;
+  }
+
+  function watchRoom(code) {
+    stopRoomWatch();
+    var until = Date.now() + ROOM_TTL_MS;
+    roomTimer = setInterval(async function () {
+      if (Date.now() > until || myRoom !== code) return stopRoomWatch();
+      try {
+        var rec = await readRoom(code);
+        if (rec && rec.answer) {
+          stopRoomWatch();
+          await accept(rec.answer);       // "open" fires next; roomAfterJoin re-arms
+        }
+      } catch (e) { /* a blip shouldn't end the wait */ }
+    }, ROOM_POLL_MS);
+  }
+
+  /** Once a player is in: re-open the room for the next one, or close it. */
+  async function roomAfterJoin() {
+    if (!myRoom) return;
+    var code = myRoom;
+    if (api.peers.length >= api.maxPeers) {
+      // leave a marker rather than deleting, so a latecomer is told the game is
+      // full instead of "no such room", which reads like they typed it wrong
+      try { await writeRoom(code, { full: true, created: Date.now() }); } catch (e) {}
+      stopRoomWatch();
+      myRoom = null;
+      emit("full", code);
+      return;
+    }
+    try {
+      await armRoom(code);
+      watchRoom(code);
+    } catch (e) { emit("error", e); }
   }
 
   async function createRoom() {
     if (!(await apiAvailable()))
       throw new Error("this site has no server, so it can't hold room codes — share the link or QR instead");
-    var inv = await host();
     var code = "";
     for (var tries = 0; tries < 5 && !code; tries++) {
       var candidate = newCode(4);
       if (!(await readRoom(candidate))) code = candidate;      // free, or expired
     }
     if (!code) throw new Error("couldn't find a free room code — try again");
-    await writeRoom(code, { offer: inv.code, answer: null, created: Date.now() });
     myRoom = code;
-
-    if (roomTimer) clearInterval(roomTimer);
-    var until = Date.now() + ROOM_TTL_MS;
-    roomTimer = setInterval(async function () {
-      if (Date.now() > until) return stopRoomWatch();
-      try {
-        var rec = await readRoom(code);
-        if (rec && rec.answer) {
-          stopRoomWatch();
-          await accept(rec.answer);
-          forgetRoom(code);
-        }
-      } catch (e) { /* a blip shouldn't end the wait */ }
-    }, ROOM_POLL_MS);
-
+    var inv = await armRoom(code);
+    watchRoom(code);
     return { room: code, code: inv.code, url: inv.url, id: inv.id,
              localOnly: inv.localOnly };
   }
@@ -589,6 +677,7 @@
     if (!(await apiAvailable()))
       throw new Error("this site has no server, so room codes don't work here — paste the invite link instead");
     var rec = await readRoom(code);
+    if (rec && rec.full) throw new Error('room "' + code + '" is full');
     if (!rec) throw new Error('no room "' + code + '" — check the code, or ask for a new one');
     var ans = await join(rec.offer);
     await writeRoom(code, { offer: rec.offer, answer: ans.code, created: rec.created });
@@ -613,6 +702,15 @@
       seen = code;
       onAnswer(code);
     };
+    // Announce that a game tab is sitting here waiting. The relay tab checks
+    // this before claiming success: if the hosting tab was closed — or the
+    // player pasted the answer into it and navigated it away, which destroys the
+    // connection — there is nobody to hand the answer to, and saying "sent back
+    // to the game" would be a lie.
+    var beat = setInterval(function () {
+      try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
+    }, 500);
+    try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
     var bc = null;
     try {
       bc = new BroadcastChannel(CHANNEL);
@@ -633,8 +731,18 @@
     });
     return function stop() {
       clearInterval(poll);
+      clearInterval(beat);
+      try { localStorage.removeItem(HOST_BEAT); } catch (e) {}
       if (bc) try { bc.close(); } catch (e) {}
     };
+  }
+
+  /** Is a game tab on this device actually waiting for an answer right now? */
+  function hostIsWaiting() {
+    try {
+      var t = parseInt(localStorage.getItem(HOST_BEAT) || "0", 10);
+      return Date.now() - t < 3000;
+    } catch (e) { return false; }
   }
 
   /** Running in the tab the host's camera opened: hand the answer to the game
@@ -689,6 +797,11 @@
   api = {
     isHost: false,
     state: null,
+    /** How many players this game seats, besides the host. A room code stays
+     *  live until that many have joined, then reports itself full. Games with a
+     *  fixed shape (pong is two paddles) must set this, or a third player
+     *  silently ends up driving somebody else's piece. */
+    maxPeers: Infinity,
     /** Peers you can actually talk to. A peer record exists from the moment its
      *  connection is created, which is well before the channel opens — reporting
      *  those as connected invites everyone to send into a socket that isn't
@@ -760,6 +873,10 @@
     _pack: pack, _unpack: unpack, _buildSdp: buildSdp, _readSdp: readSdp,
   };
   window.kmp = api;
+
+  // Once a player is in, the room either re-opens for the next one or closes.
+  // Driven off "open" so it covers every route in — typed code, QR, or paste.
+  api.on("open", function () { roomAfterJoin(); });
 
   // ── dock UI ────────────────────────────────────────────────────────────────
   if (!window.kdock) return;
@@ -1014,11 +1131,23 @@
   // Not on the "load" event: this file is injected by the feature loader, which
   // usually finishes after load has already fired — so that listener never runs.
   if (answerInUrl) {
+    var delivered = hostIsWaiting();
     var banner = function () {
       var note = document.createElement("div");
       note.style.cssText = "position:fixed;inset:auto 0 0 0;z-index:99960;padding:1rem;" +
-        "background:#065f46;color:#fff;font:600 15px system-ui;text-align:center";
-      note.textContent = "✓ Answer sent back to the game — you can close this tab.";
+        "font:600 15px/1.5 system-ui;text-align:center;color:#fff;background:" +
+        (delivered ? "#065f46" : "#7c2d12");
+      if (delivered) {
+        note.textContent = "✓ Answer sent back to the game — you can close this tab.";
+      } else {
+        // Almost always: they pasted the answer into the tab that was hosting,
+        // which navigated it away and took the connection with it.
+        note.innerHTML = "⚠ No game is waiting on this device.<br>" +
+          "<span style='font-weight:400;font-size:14px'>The tab that created the " +
+          "room was closed, or this link was opened in it. Create a room again and " +
+          "use <b>“Paste their answer”</b> on that screen instead of opening the " +
+          "link.</span>";
+      }
       document.body.appendChild(note);
     };
     if (document.body) banner();
