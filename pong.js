@@ -437,6 +437,10 @@
     state.bvx = -fromSide * speed * Math.cos(ang);
     state.bvz = speed * Math.sin(ang);
     state.bx = fromSide === -1 ? -PADDLE_X + PADDLE_D / 2 + BALL_R : PADDLE_X - PADDLE_D / 2 - BALL_R;
+    // A bounce reverses the ball, and until the guest hears about it its
+    // prediction is confidently heading the wrong way. Discrete events are
+    // worth their own packet — the same reason score() sends one.
+    if (state.mode === "host" && connected) sendState();
   }
 
   function score(who) {
