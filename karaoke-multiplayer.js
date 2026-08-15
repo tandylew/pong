@@ -207,39 +207,67 @@
     });
   }
 
-  function track(pc, ch, id) {
-    var rec = { id: id, pc: pc, ch: ch, alive: Date.now(), timer: null };
-    peers[id] = rec;
-
-    ch.addEventListener("open", function () {
-      rec.alive = Date.now();
-      rec.timer = setInterval(function () {
-        if (Date.now() - rec.alive > DEAD_MS) return drop(id, "timed out");
-        try { ch.send(JSON.stringify({ t: "ping" })); } catch (e) { drop(id, "send failed"); }
-      }, PING_MS);
-      emit("open", id);
-      if (api.isHost && api.state !== null) sendTo(rec, { t: "state", s: api.state });
-    });
-    ch.addEventListener("message", function (e) {
-      rec.alive = Date.now();
-      var msg;
-      try { msg = JSON.parse(e.data); } catch (err) { return; }
-      if (msg.t === "ping") { try { ch.send(JSON.stringify({ t: "pong" })); } catch (e2) {} return; }
-      if (msg.t === "pong") return;
-      if (msg.t === "state") { api.state = msg.s; emit("state", msg.s, id); return; }
-      if (msg.t === "msg") {
-        emit("data", msg.d, id);
-        // the host is the hub: a star topology means relaying, or players two
-        // and three never hear each other
-        if (api.isHost) broadcast({ t: "msg", d: msg.d }, id);
+  function handleMessage(rec, id, raw) {
+    rec.alive = Date.now();
+    var msg;
+    try { msg = JSON.parse(raw); } catch (err) { return; }
+    if (msg.t === "ping") {
+      // echo the sender's clock back untouched; they turn it into RTT
+      try { rec.ch.send(JSON.stringify({ t: "pong", c: msg.c })); } catch (e2) {}
+      return;
+    }
+    if (msg.t === "pong") {
+      if (typeof msg.c === "number") {
+        var sample = Math.max(0, now() - msg.c);
+        // a rolling median would be nicer; an EMA is one line and good enough
+        rec.rtt = rec.rtt == null ? sample : rec.rtt * 0.7 + sample * 0.3;
+        api.rtt = rec.rtt;
       }
-    });
-    ch.addEventListener("close", function () { drop(id, "closed"); });
+      return;
+    }
+    if (msg.t === "state") { api.state = msg.s; emit("state", msg.s, id); return; }
+    if (msg.t === "snap") { takeSnapshot(msg, rec); return; }
+    if (msg.t === "msg") {
+      emit("data", msg.d, id);
+      // the host is the hub: a star topology means relaying, or players two
+      // and three never hear each other
+      if (api.isHost) broadcast({ t: "msg", d: msg.d }, id);
+    }
+  }
+
+  function track(pc, id) {
+    var rec = { id: id, pc: pc, ch: null, fast: null, alive: Date.now(),
+                timer: null, rtt: null };
+    peers[id] = rec;
     pc.addEventListener("connectionstatechange", function () {
       if (pc.connectionState === "failed" || pc.connectionState === "disconnected")
         drop(id, pc.connectionState);
     });
     return rec;
+  }
+
+  /** Attach one of a peer's two channels. `kind` is "ch" (reliable, ordered —
+   *  chat, control, joins) or "fast" (unreliable, unordered — position
+   *  snapshots). Splitting them matters on real Wi-Fi: a lost position packet
+   *  retransmitted in order arrives too late to be useful AND holds up every
+   *  fresher one behind it, which is what rubber-banding actually is. */
+  function attach(rec, channel, kind) {
+    rec[kind] = channel;
+    channel.addEventListener("message", function (e) { handleMessage(rec, rec.id, e.data); });
+    channel.addEventListener("close", function () {
+      if (kind === "ch") drop(rec.id, "closed");
+    });
+    if (kind !== "ch") return;
+    channel.addEventListener("open", function () {
+      rec.alive = Date.now();
+      rec.timer = setInterval(function () {
+        if (Date.now() - rec.alive > DEAD_MS) return drop(rec.id, "timed out");
+        try { channel.send(JSON.stringify({ t: "ping", c: now() })); }
+        catch (e) { drop(rec.id, "send failed"); }
+      }, PING_MS);
+      emit("open", rec.id);
+      if (api.isHost && api.state !== null) sendTo(rec, { t: "state", s: api.state });
+    });
   }
 
   /** Losing a player must not take the game down: tear that one peer down,
@@ -250,19 +278,116 @@
     delete peers[id];
     if (rec.timer) clearInterval(rec.timer);
     try { rec.ch.close(); } catch (e) {}
+    try { rec.fast.close(); } catch (e) {}
     try { rec.pc.close(); } catch (e) {}
+    if (!Object.keys(peers).length) api.rtt = null;
     emit("close", id, why);
   }
 
   function sendTo(rec, obj) {
     try {
-      if (rec.ch.readyState === "open") rec.ch.send(JSON.stringify(obj));
+      if (rec.ch && rec.ch.readyState === "open") rec.ch.send(JSON.stringify(obj));
     } catch (e) { drop(rec.id, "send failed"); }
+  }
+  /** Snapshots go over the unreliable channel and are simply dropped if it isn't
+   *  ready — a stale position is worse than a missing one, and the next tick is
+   *  milliseconds away. */
+  function sendFast(rec, obj) {
+    var c = rec.fast && rec.fast.readyState === "open" ? rec.fast : rec.ch;
+    try {
+      if (c && c.readyState === "open") c.send(JSON.stringify(obj));
+    } catch (e) { /* let the heartbeat decide whether this peer is really gone */ }
   }
   function broadcast(obj, exceptId) {
     Object.keys(peers).forEach(function (id) {
       if (id !== String(exceptId)) sendTo(peers[id], obj);
     });
+  }
+  function broadcastFast(obj, exceptId) {
+    Object.keys(peers).forEach(function (id) {
+      if (id !== String(exceptId)) sendFast(peers[id], obj);
+    });
+  }
+
+  // ── sync: making a moving object look the same on both screens ─────────────
+  /* Sending positions 12 times a second and easing towards whatever arrived is
+   * the obvious approach, and it always looks bad: the follower is a fixed lag
+   * behind and moves in steps. Three things fix it, and none of them are the
+   * network — the data channel here measures under 2 ms.
+   *
+   *   1. Send VELOCITY alongside position. The receiver can then work out where
+   *      the object is *now* instead of drawing where it was.
+   *   2. Subtract the wire time. A snapshot describes the world as of when it
+   *      was sent, which was rtt/2 ago, so that has to be added back or every
+   *      follower is permanently half a round-trip behind.
+   *   3. Ease the CORRECTION, not the position. Predictions are wrong at every
+   *      bounce; snapping is jarring and easing the position reintroduces lag.
+   *      Easing only the error keeps latency at zero and hides the seam.
+   *
+   * Configure once, publish on the host, read on every frame:
+   *
+   *   kmp.sync.configure({ rate: 30, predict: { bx: "bvx", by: "bvy" } });
+   *   kmp.sync.publish({ bx, by, bvx, bvy, score });   // host
+   *   const s = kmp.sync.read();                       // anyone, every frame
+   */
+  var syncCfg = { rate: 30, predict: {}, maxAheadMs: 300, smoothMs: 120 };
+  var snap = null;            // newest snapshot + when it landed
+  var corr = {};              // per-key correction still being eased away
+  var lastPublish = 0;
+
+  var now = (typeof performance !== "undefined" && performance.now)
+    ? function () { return performance.now(); }
+    : function () { return Date.now(); };
+
+  function takeSnapshot(msg, rec) {
+    var prev = snap && snap.s;
+    var incoming = msg.s || {};
+    if (prev) {
+      // Where did we *say* the object was a moment ago? Whatever the difference
+      // is, carry it as a correction and bleed it off over smoothMs.
+      var predicted = predictInto({}, snap, 0);
+      for (var k in syncCfg.predict) {
+        if (typeof predicted[k] === "number" && typeof incoming[k] === "number")
+          corr[k] = (corr[k] || 0) + (predicted[k] - incoming[k]);
+      }
+    }
+    snap = { s: incoming, at: now(), t: msg.c };
+    api.sync.seq = msg.n;
+    emit("snapshot", incoming, rec ? rec.id : null);
+  }
+
+  function predictInto(out, from, extraMs) {
+    var s = from.s, ageMs = Math.min(syncCfg.maxAheadMs, now() - from.at + extraMs);
+    for (var k in s) out[k] = s[k];
+    for (var key in syncCfg.predict) {
+      var vk = syncCfg.predict[key];
+      if (typeof s[key] === "number" && typeof s[vk] === "number")
+        out[key] = s[key] + s[vk] * (ageMs / 1000);
+    }
+    return out;
+  }
+
+  function readSync() {
+    if (!snap) return null;
+    // half the round trip is how stale the snapshot already was on arrival
+    var lead = api.rtt ? api.rtt / 2 : 0;
+    var out = predictInto({}, snap, lead);
+    var decay = Math.exp(-16 / Math.max(1, syncCfg.smoothMs));   // ~per 16 ms frame
+    for (var k in corr) {
+      if (Math.abs(corr[k]) < 1e-4) { delete corr[k]; continue; }
+      out[k] += corr[k];
+      corr[k] *= decay;
+    }
+    return out;
+  }
+
+  function publishSync(state, force) {
+    api.state = state;
+    var t = now();
+    if (!force && t - lastPublish < 1000 / syncCfg.rate) return false;
+    lastPublish = t;
+    broadcastFast({ t: "snap", s: state, c: t, n: ++api.sync.seq });
+    return true;
   }
 
   // ── host / join ────────────────────────────────────────────────────────────
@@ -306,8 +431,11 @@
     api.isHost = true;
     var pc = newPeerConnection();
     var id = "p" + nextId++;
-    var ch = pc.createDataChannel(CHANNEL, { ordered: true });
-    track(pc, ch, id);
+    var rec = track(pc, id);
+    // reliable for control, unreliable for the position firehose
+    attach(rec, pc.createDataChannel(CHANNEL, { ordered: true }), "ch");
+    attach(rec, pc.createDataChannel(CHANNEL + "-fast",
+                                     { ordered: false, maxRetransmits: 0 }), "fast");
     await pc.setLocalDescription(await pc.createOffer());
     await gathered(pc);
     var code = pack(pc.localDescription.sdp, false);
@@ -330,7 +458,10 @@
     if (f.isAnswer) throw new Error("that's an answer code, not an invitation");
     var pc = newPeerConnection();
     var id = "host";
-    pc.addEventListener("datachannel", function (e) { track(pc, e.channel, id); });
+    var rec = track(pc, id);
+    pc.addEventListener("datachannel", function (e) {
+      attach(rec, e.channel, e.channel.label.endsWith("-fast") ? "fast" : "ch");
+    });
     await pc.setRemoteDescription({ type: "offer", sdp: buildSdp(f, "offer") });
     await pc.setLocalDescription(await pc.createAnswer());
     await gathered(pc);
@@ -558,7 +689,21 @@
   api = {
     isHost: false,
     state: null,
-    get peers() { return Object.keys(peers); },
+    /** Peers you can actually talk to. A peer record exists from the moment its
+     *  connection is created, which is well before the channel opens — reporting
+     *  those as connected invites everyone to send into a socket that isn't
+     *  listening yet, and then wonder where the message went. */
+    get peers() {
+      return Object.keys(peers).filter(function (id) {
+        return peers[id].ch && peers[id].ch.readyState === "open";
+      });
+    },
+    /** Everyone including those still handshaking — for "connecting…" UI. */
+    get pending() {
+      return Object.keys(peers).filter(function (id) {
+        return !(peers[id].ch && peers[id].ch.readyState === "open");
+      });
+    },
     on: function (evt, fn) { (listeners[evt] = listeners[evt] || []).push(fn); return api; },
     off: function (evt, fn) {
       listeners[evt] = (listeners[evt] || []).filter(function (f) { return f !== fn; });
@@ -580,10 +725,30 @@
       },
     },
     send: function (obj) { broadcast({ t: "msg", d: obj }); },
+    /** Fire-and-forget, over the unreliable channel. For anything sent every
+     *  frame — paddle positions, cursor moves — where the newest value makes
+     *  every older one irrelevant. */
+    sendFast: function (obj) { broadcastFast({ t: "msg", d: obj }); },
     setState: function (s) {
       api.state = s;
       if (api.isHost) broadcast({ t: "state", s: s });
       emit("state", s, "self");
+    },
+    /** Round-trip time in ms, measured off the heartbeat. null until known. */
+    rtt: null,
+    sync: {
+      seq: 0,
+      configure: function (opts) {
+        for (var k in (opts || {})) syncCfg[k] = opts[k];
+        return syncCfg;
+      },
+      /** Host: hand over the authoritative state. Rate-limited to `rate`, so
+       *  calling it every frame is fine and correct. */
+      publish: publishSync,
+      /** Anyone: the state advanced to right now. Call it per frame. */
+      read: readSync,
+      raw: function () { return snap && snap.s; },
+      reset: function () { snap = null; corr = {}; },
     },
     disconnect: function () {
       stopRoomWatch();
