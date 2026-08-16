@@ -711,6 +711,12 @@
       try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
     }, 500);
     try { localStorage.setItem(HOST_BEAT, String(Date.now())); } catch (e) {}
+    // Leaving the page takes the connection with it, so retract the claim at
+    // once — otherwise the relay tab loads inside the heartbeat's grace window
+    // and reports success to a game that no longer exists.
+    var bye = function () { try { localStorage.removeItem(HOST_BEAT); } catch (e) {} };
+    window.addEventListener("pagehide", bye);
+    window.addEventListener("beforeunload", bye);
     var bc = null;
     try {
       bc = new BroadcastChannel(CHANNEL);
@@ -877,6 +883,29 @@
   // Once a player is in, the room either re-opens for the next one or closes.
   // Driven off "open" so it covers every route in — typed code, QR, or paste.
   api.on("open", function () { roomAfterJoin(); });
+
+  /* Pasting the answer link into the address bar of the tab that is hosting is
+   * the obvious thing to try, and it used to do nothing at all: the URL differs
+   * only by its #fragment, so the browser changes the hash WITHOUT reloading,
+   * and this file — which read the hash once at startup — never noticed.
+   *
+   * That same-document behaviour is a gift, though: the connection is still
+   * alive, so the answer can simply be accepted on the spot. The instinct turns
+   * out to be the fastest route there is. */
+  window.addEventListener("hashchange", function () {
+    var m = /[#&]kmpa=([A-Za-z0-9\-_]+)/.exec(location.hash || "");
+    if (!m) return;
+    history.replaceState(null, "", baseUrl());
+    if (pendingHost) {
+      accept(m[1]).catch(function (e) { emit("error", e); });
+    } else {
+      // no offer outstanding here — pass it to whichever tab is waiting
+      relayAnswerAndExit(m[1]);
+      emit("error", new Error(hostIsWaiting()
+        ? "answer handed to the game tab that's waiting"
+        : "no game on this device is waiting for an answer — create a room first"));
+    }
+  });
 
   // ── dock UI ────────────────────────────────────────────────────────────────
   if (!window.kdock) return;
