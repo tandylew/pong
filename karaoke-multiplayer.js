@@ -892,20 +892,24 @@
    * That same-document behaviour is a gift, though: the connection is still
    * alive, so the answer can simply be accepted on the spot. The instinct turns
    * out to be the fastest route there is. */
-  window.addEventListener("hashchange", function () {
-    var m = /[#&]kmpa=([A-Za-z0-9\-_]+)/.exec(location.hash || "");
-    if (!m) return;
-    history.replaceState(null, "", baseUrl());
-    if (pendingHost) {
-      accept(m[1]).catch(function (e) { emit("error", e); });
-    } else {
-      // no offer outstanding here — pass it to whichever tab is waiting
-      relayAnswerAndExit(m[1]);
-      emit("error", new Error(hostIsWaiting()
-        ? "answer handed to the game tab that's waiting"
-        : "no game on this device is waiting for an answer — create a room first"));
-    }
-  });
+  // guarded because the test suite loads this file under Node, where `window`
+  // is a bare object with no event target on it
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("hashchange", function () {
+      var m = /[#&]kmpa=([A-Za-z0-9\-_]+)/.exec(location.hash || "");
+      if (!m) return;
+      history.replaceState(null, "", baseUrl());
+      if (pendingHost) {
+        accept(m[1]).catch(function (e) { emit("error", e); });
+      } else {
+        // no offer outstanding here — pass it to whichever tab is waiting
+        relayAnswerAndExit(m[1]);
+        emit("error", new Error(hostIsWaiting()
+          ? "answer handed to the game tab that's waiting"
+          : "no game on this device is waiting for an answer — create a room first"));
+      }
+    });
+  }
 
   // ── dock UI ────────────────────────────────────────────────────────────────
   if (!window.kdock) return;
